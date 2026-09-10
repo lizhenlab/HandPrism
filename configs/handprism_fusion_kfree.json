@@ -1,0 +1,64 @@
+{
+  "name": "handprism_fusion_kfree",
+  "seed": 260820308,
+  "solver": "kfree",
+  "steps": 20000,
+  "warmup_steps": 200,
+  "batch_size_per_gpu": 1,
+  "gradient_accumulation": 4,
+  "num_workers": 2,
+  "log_every": 1,
+  "validate_every": 500,
+  "checkpoint_every": 500,
+  "validation_batches_per_dataset": 8,
+  "dtype": "bfloat16",
+  "trainable_dtype": "float32",
+  "gradient_checkpointing": true,
+  "gradient_clip": 1,
+  "weight_decay": 0.01,
+  "kfree_camera_fit": {
+    "enabled": true,
+    "variance_floor": 0.0001,
+    "focal_min": 0.05,
+    "focal_max": 10,
+    "loss_weight": 5,
+    "warmup_steps": 500,
+    "loss_norm": "l1",
+    "assumption_note": "Fusion uses a normalized 2D fit RMS guard of 0.01 and native camera projection or predicted ray inversion for pixel gating.",
+    "max_rms_normalized": 0.01,
+    "target": "pinhole_compatible"
+  },
+  "learning_rates": {
+    "decoder": 0.0002,
+    "lora": 0.0001,
+    "patch_embedding": 0.00002
+  },
+  "dataset_weights": {
+    "arctic": 0.4375,
+    "hot3d": 0.5625
+  },
+  "dataset_weight_policy": "ARCTIC:HOT3D = 7:9; normalized two-dataset sampling",
+  "hardware_policy": "8 A800-40GB GPUs x 1 clip x 4 accumulation = effective batch 32",
+  "data_contract": "Frozen ARCTIC/HOT3D v2_clean split; only these two sources are permitted",
+  "dataset_roots": {
+    "arctic": "data/arctic",
+    "hot3d": "data/hot3d"
+  },
+  "manifests": "data/manifests/two_dataset_v2_clean",
+  "mano_model": "assets/body_models/mano",
+  "model_dir": "models/Wan2.2-Fun-5B-Control",
+  "videox_fun": "third_party/VideoX-Fun",
+  "implementation_id": "handprism-fusion-r2",
+  "geometry_dtype": "float32",
+  "loss_reduction": "per_clip",
+  "decoder": {
+    "anchor_offset_cells": 0
+  },
+  "architecture_contract": {
+    "query_attention": "bidirectional_joint_time_query_with_temporal_RoPE",
+    "direct_joints": "latent_coordinate_interpolation",
+    "pnp_residual": "camera_pixel_projection_or_predicted_ray_inverse",
+    "backbone_grid": "official_32x_spatial_compression"
+  },
+  "architecture": "handprism-fusion"
+}

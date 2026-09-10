@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handprism"
+version = "0.3.1"
+description = "HandPrism: geometry-aware 3D hand motion reconstruction from egocentric video"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.4",
+  "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+backbone = [
+  "accelerate>=0.34",
+  "diffusers>=0.31",
+  "einops>=0.8",
+  "huggingface-hub>=0.25",
+  "safetensors>=0.4",
+  "transformers>=4.45",
+]
+data = [
+  "av>=12",
+  "pillow>=10",
+  "projectaria-tools>=1.6",
+]
+mano = ["smplx>=0.1.28", "scipy>=1.15", "chumpy>=0.70"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

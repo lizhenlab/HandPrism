@@ -1,0 +1,52 @@
+{
+  "name": "handprism_core_standard",
+  "seed": 260820308,
+  "solver": "standard",
+  "steps": 20000,
+  "warmup_steps": 200,
+  "batch_size_per_gpu": 1,
+  "gradient_accumulation": 8,
+  "num_workers": 2,
+  "log_every": 1,
+  "validate_every": 500,
+  "checkpoint_every": 500,
+  "validation_batches_per_dataset": 8,
+  "dtype": "bfloat16",
+  "trainable_dtype": "float32",
+  "gradient_checkpointing": true,
+  "gradient_clip": 1,
+  "weight_decay": 0.01,
+  "learning_rates": {
+    "decoder": 0.0002,
+    "lora": 0.0001,
+    "patch_embedding": 0.00002
+  },
+  "dataset_weights": {
+    "arctic": 0.4375,
+    "hot3d": 0.5625
+  },
+  "dataset_weight_policy": "ARCTIC:HOT3D = 7:9; normalized two-dataset sampling",
+  "hardware_policy": "8 A800-40GB GPUs x 1 clip x 8 accumulation = effective batch 64",
+  "data_contract": "Frozen ARCTIC/HOT3D v2_clean split; only these two sources are permitted",
+  "dataset_roots": {
+    "arctic": "data/arctic",
+    "hot3d": "data/hot3d"
+  },
+  "manifests": "data/manifests/two_dataset_v2_clean",
+  "mano_model": "assets/body_models/mano",
+  "model_dir": "models/Wan2.2-Fun-5B-Control",
+  "videox_fun": "third_party/VideoX-Fun",
+  "implementation_id": "handprism-core-r1",
+  "geometry_dtype": "float32",
+  "loss_reduction": "per_clip",
+  "decoder": {
+    "anchor_offset_cells": 0
+  },
+  "architecture_contract": {
+    "query_attention": "per_query_bidirectional_temporal_RoPE",
+    "direct_joints": "hidden_feature_interpolation",
+    "pnp_residual": "bearing_residual_times_image_diagonal_proxy",
+    "backbone_grid": "official_32x_spatial_compression"
+  },
+  "architecture": "handprism-core"
+}

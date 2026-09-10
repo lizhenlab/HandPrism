@@ -1,0 +1,41 @@
+{
+  "format": "handprism-release-manifest-v1",
+  "release": "v0.3.1",
+  "architecture": "handprism-core",
+  "implementation_id": "handprism-core-r1",
+  "checkpoint_step": 20000,
+  "datasets": ["arctic", "hot3d"],
+  "usage": "inference and evaluation only; not training resume",
+  "terms": "WEIGHTS_TERMS.md",
+  "assets": [
+    {
+      "solver": "standard",
+      "file": "handprism-core-standard-step020000.safetensors",
+      "url": "https://github.com/lizhenlab/HandPrism/releases/download/v0.3.1/handprism-core-standard-step020000.safetensors",
+      "bytes": 702099580,
+      "sha256": "1fce71c40d7119c0b1fe0a16662c99f030380dc9928c35268d7aaf7d675d9fd8",
+      "source_checkpoint_sha256": "685da372b8ed631d23d720250a541c43a59816c3927d50b81c64ae5ba27f40f7",
+      "trainable_tensors": 755,
+      "parameters": 175503289,
+      "exact_tensor_equality_verified": true
+    },
+    {
+      "solver": "kfree",
+      "file": "handprism-core-kfree-step020000.safetensors",
+      "url": "https://github.com/lizhenlab/HandPrism/releases/download/v0.3.1/handprism-core-kfree-step020000.safetensors",
+      "bytes": 702099956,
+      "sha256": "90f98aac9b5393b9b8f4d26395ae72770f4f30970b4a3ed0bc99812e2020d7c2",
+      "source_checkpoint_sha256": "821a2684f5ae9f4fab7c8329123de0e1e30e43f8317f4efa95a0c574bd1698e4",
+      "trainable_tensors": 755,
+      "parameters": 175503289,
+      "exact_tensor_equality_verified": true
+    }
+  ],
+  "required_external_assets": {
+    "wan_model": "alibaba-pai/Wan2.2-Fun-5B-Control",
+    "wan_revision": "b8bc1a65ab71d054ba4636dc0dac104aa4df2686",
+    "videox_fun_revision": "6f3fb60dad9b6a60ff6f962e62cffa11cafb084b",
+    "mano": "separately licensed left and right MANO models"
+  },
+  "fusion_weights_available": false
+}
