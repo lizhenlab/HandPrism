@@ -1,6 +1,6 @@
 # HandPrism 评测口径
 
-本页对应 `src/dreamhand/evaluator.py` 与 `src/dreamhand/metrics.py` 的当前实现。比较结果时须同时核对架构、相机模式、清单哈希、checkpoint、指标定义与数值单位；不能只根据指标缩写认为不同实验可直接横比。
+本页对应 `src/handprism/evaluator.py` 与 `src/handprism/metrics.py` 的当前实现。比较结果时须同时核对架构、相机模式、清单哈希、checkpoint、指标定义与数值单位；不能只根据指标缩写认为不同实验可直接横比。
 
 ## 输入与检测匹配
 
@@ -27,8 +27,33 @@ Standard 与 K-free 评测均使用真实标定投影以计算统一的检测匹
 
 Standard 与 K-free 的 `EPE2D-p_px` 预测来源不同，比较时必须注明模式。当前 `CT-p_m` 与历史旧 CT 也不是同一定义。腕点和 MANO 原生平移在形状相关的 J0 偏移下不同，导出时分别使用 `wrist_camera` 和 `mano_translation`。
 
+## 指标协议 2 的统一增量
+
+上述历史指标继续保留原定义。新报告顶层和各数据集均标注 `metric_protocol_version=2`，两种 solver 统一增加以下指标，不依赖预测是否匹配来隐藏误差：
+
+| 指标 | 含义 |
+| --- | --- |
+| `AnchorEPE_px` | 有效 GT 二维关节上的预测 anchor 像素误差，两种 solver 同一来源 |
+| `MANOReprojectionEPE_px` | 有效 MANO/二维 GT 上的最终三维关节经真实相机投影的像素误差；非正有效深度用图像对角线惩罚 |
+| `CameraMPJPE_mm`、`WristAbsolute_mm`、`DepthAbsolute_mm` | 无对齐的相机空间关节、腕点三维和腕点 Z 误差 |
+| `RootPVE_mm`、`CameraPVE_mm` | 根节点相对和绝对位置下的 MANO 顶点误差 |
+| `Root/WristVelocityError_m_s`、`Root/WristAccelerationError_m_s2` | 预测运动相对 GT 的速度/加速度误差，分别报告手部相对形变与腕点轨迹 |
+| `ExistenceCoverage` | 有效 GT 手上存在性分数 >0.5 的比例；需同时看 F1/误检率，不是几何匹配召回率 |
+
+新增指标附各自有效数量。无标签或无有效时间间隔时为 `null`，不是零误差。时间差先在 FP64 中计算；重复时间、间隔 >0.15 秒及无效关节会断开速度/加速度区间。Core 没有时间轴时动态增量不可用，不能据此填零。
+
+按 GT 固定分层输出 `RootMPJPE_mm / CameraMPJPE_mm / WristAbsolute_mm / DepthAbsolute_mm / ExistenceCoverage` 和手帧数：边缘（32 px）、小手（框对角线 <48 px）、快动作（腕速 >1 m/s）、OOS、可信遮挡。遮挡标签未知时该分层没有样本，不用投影在图内代替真实遮挡标签。
+
+`oos_within_clip_le0p5s / oos_within_clip_0p5_1s / oos_within_clip_gt1s` 按当前片段内连续 OOS 的首末帧时间差分层。窗口边界、时间缺口、邻近无效标注造成截断，另报 `OOS_censored_runs`。这是片段内观测跨度，不是完整出画时长，也不代表跨窗口关联。
+
+启用新质量/先验头时，另报 `QualityTargetMAE`、五箱 `QualitySoftECE`、固定阈值 0.25/0.5/0.75/0.9 下的 anchor 风险/覆盖率；质量目标是软定位精度 `exp(-error_px/8)`，不是二元遮挡概率。腕点报 Laplace NLL（省略常数）、平均尺度、95% **逐坐标轴** 区间覆盖率，以及尺度向量范数 <2 cm 却腕点误差 >10 cm 的比例/计数。空高置信集合输出 null，不能当成无失败。
+
+模型选择只用完整 val 的固定精度/覆盖复合分数，定义见 [Fusion 指南](FUSION_R4.md#验证与-checkpoint-选择)。最终 test 不参与阈值、loss、采样或 best 选择。
+
 ## 求解诊断与完成条件
 
 求解器的 `pnp_rms_pixels` 是兼容字段名，解释时必须读取 `pnp_residual_kind`：Core 为 `bearing_diagonal_proxy`，不是实测像素误差；Fusion 为 `native_pixels`，对应原生相机投影或预测 ray 场逆映射的像素残差。两者不能按字段名直接比较。
+
+有先验融合时，上述 RMS 是融合前几何候选的诊断；最终质量看最终输出的 reprojection/absolute 指标，结合 `geometry_weight`，不能把候选接受率等同最终准确率。
 
 完整流程只接受包含两数据集完整计数、step 20000、匹配的架构/实现 ID/solver/checkpoint 哈希且数值有限的 metrics。subset、诊断输出或仅有进度文件不代表完成。CPU 回归仅验证程序约定，完整模型精度和吞吐仍需实际 GPU 实验验收。

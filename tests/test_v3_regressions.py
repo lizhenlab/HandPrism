@@ -7,24 +7,24 @@ from pathlib import Path
 import pytest
 import torch
 
-from dreamhand.camera import project_pinhole
-from dreamhand.config import DecoderConfig, SolverConfig
-from dreamhand.decoder import DreamHandDecoder, interpolate_time
-from dreamhand.data.dataset import read_jsonl
-from dreamhand.data.policy import manifest_path
-from dreamhand.mano import ToyMano
-from dreamhand.model import DreamHandModel
-from dreamhand.ray import (
+from handprism.camera import project_pinhole
+from handprism.config import DecoderConfig, SolverConfig
+from handprism.decoder import HandPrismDecoder, interpolate_time
+from handprism.data.dataset import read_jsonl
+from handprism.data.policy import manifest_path
+from handprism.mano import ToyMano
+from handprism.model import HandPrismModel
+from handprism.ray import (
     fit_effective_pinhole_camera,
     mixed_pnp,
     normalized_pixel_grid,
     project_via_ray_field,
     sample_ray_bearings,
 )
-from dreamhand.losses import camera_fit_bearing_loss, DreamHandLoss
-from dreamhand.completion import validated_metrics, file_sha256
-from dreamhand.version import IMPLEMENTATION_ID
-from dreamhand.architectures import FUSION
+from handprism.losses import camera_fit_bearing_loss, HandPrismLoss
+from handprism.completion import validated_metrics, file_sha256
+from handprism.version import IMPLEMENTATION_ID
+from handprism.architectures import FUSION
 from scripts.run_pipeline import evaluation_directory, resource_preflight
 from scripts.train import load_config, restore_checkpoint, validate
 
@@ -42,7 +42,7 @@ def decoder_input():
 
 def test_registers_influence_readout_and_receive_gradients():
     features, rays = decoder_input()
-    model = DreamHandDecoder(tiny_config(), architecture="handprism-fusion").eval()
+    model = HandPrismDecoder(tiny_config(), architecture="handprism-fusion").eval()
     before = model(features, rays, 7)
     before.global_rotation_6d.square().sum().backward()
     assert model.queries.grad[-4:].abs().sum() > 1e-6
@@ -54,7 +54,7 @@ def test_registers_influence_readout_and_receive_gradients():
 
 def test_joint_queries_can_communicate_with_hand_queries():
     features, rays = decoder_input()
-    model = DreamHandDecoder(tiny_config(), architecture="handprism-fusion").eval()
+    model = HandPrismDecoder(tiny_config(), architecture="handprism-fusion").eval()
     before = model(features, rays, 7).global_rotation_6d
     with torch.no_grad():
         model.queries[2:44] += torch.randn_like(model.queries[2:44])
@@ -64,7 +64,7 @@ def test_joint_queries_can_communicate_with_hand_queries():
 
 def test_direct_joint_coordinates_are_interpolated_after_latent_mlp():
     features, rays = decoder_input()
-    model = DreamHandDecoder(tiny_config(), architecture="handprism-fusion").eval()
+    model = HandPrismDecoder(tiny_config(), architecture="handprism-fusion").eval()
     output = model(features, rays, 7)
     joint_tokens = output.query_features_latent[:, :, 2:44].reshape(1, 3, 2, 21, 16)
     points = model.joint_head(joint_tokens)
@@ -151,7 +151,7 @@ def test_fit_loss_does_not_force_a_fisheye_target_to_pinhole():
 @pytest.mark.parametrize("architecture", ["handprism-core", "handprism-fusion"])
 def test_kfree_forward_ignores_all_ground_truth_camera_inputs(architecture):
     features, _ = decoder_input()
-    model = DreamHandModel(ToyMano(), tiny_config(), architecture=architecture).eval()
+    model = HandPrismModel(ToyMano(), tiny_config(), architecture=architecture).eval()
     size = torch.tensor([[480.0, 640.0]])
     first = model(features, target_frames=7, solver="kfree", image_size=size)
     second = model(
@@ -197,19 +197,19 @@ def test_old_config_cannot_start_v3(tmp_path):
 
 def test_old_checkpoint_is_rejected_before_loading_parameters(tmp_path):
     path = tmp_path / "old.pt"
-    torch.save({"format": "dreamhand-three-dataset-checkpoint-v1"}, path)
+    torch.save({"format": "unsupported-training-checkpoint"}, path)
     config = load_config(Path(__file__).resolve().parents[1] / "configs/handprism_fusion_standard.json")
     with pytest.raises(ValueError, match="checkpoint architecture/implementation mismatch"):
         restore_checkpoint(path, None, None, None, 0, 1, config)
 
 
 def test_validation_reports_direct_mano_and_final_test_protocol():
-    from dreamhand.completion import require_finite_json
+    from handprism.completion import require_finite_json
 
     class SmallSystem(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.hand = DreamHandModel(ToyMano(), tiny_config(), architecture="handprism-fusion")
+            self.hand = HandPrismModel(ToyMano(), tiny_config(), architecture="handprism-fusion")
 
         def forward(self, features, **kwargs):
             return self.hand(features, **kwargs)
@@ -251,11 +251,12 @@ def test_validation_reports_direct_mano_and_final_test_protocol():
         "valid_joints_2d": valid_joints,
         "valid_ray": torch.ones(1, dtype=torch.bool),
     }
-    config = {"solver": "standard", "steps": 500, "validation_batches_per_dataset": 1}
+    config = {"solver": "standard", "steps": 500, "validation_batches_per_dataset": 1,
+              "architecture": "handprism-fusion", "fusion": {}}
     result = validate(
         system,
         lambda video: features,
-        DreamHandLoss(),
+        HandPrismLoss(),
         {"arctic": [batch]},
         config,
         torch.device("cpu"),

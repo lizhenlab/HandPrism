@@ -9,7 +9,7 @@ from scripts.train import (
     load_config,
 )
 import pytest
-from dreamhand.architectures import FUSION, architecture_spec
+from handprism.architectures import FUSION, architecture_spec
 
 
 def test_draw_sampler_preserves_requested_per_gpu_batch_and_rank_disjointness() -> None:
@@ -63,6 +63,7 @@ def test_load_config_accepts_arctic_hot3d_only(tmp_path) -> None:
                 "geometry_dtype": "float32",
                 "loss_reduction": "per_clip",
                 "decoder": {"anchor_offset_cells": 0.0},
+                "fusion": {},
             }
         )
     )

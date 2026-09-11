@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from dreamhand.data import DreamHandWindowDataset
+from handprism.data import HandPrismWindowDataset
 
 
 BONES = tuple(
@@ -99,14 +99,14 @@ def main() -> int:
     output_root = args.output if args.output.is_absolute() else root / args.output
     report = []
     for dataset in ("arctic", "hot3d"):
-        data = DreamHandWindowDataset(
+        data = HandPrismWindowDataset(
             manifest_root / f"{dataset}_{args.split}.jsonl",
             mano_model_path=mano_model,
             training=args.split == "train",
         )
         index = (0, 260820308) if args.split == "train" else 0
         report.append(render_sample(data[index], output_root / f"{dataset}_{args.split}.png"))
-    payload = {"format": "dreamhand-data-overlay-v1", "samples": report}
+    payload = {"format": "handprism-data-overlay-v1", "samples": report}
     (output_root / "report.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n"
     )

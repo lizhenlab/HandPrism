@@ -4,7 +4,7 @@ import json
 
 import torch
 
-from dreamhand.data.arctic import _declared_image_offset, distort_camera_points
+from handprism.data.arctic import _declared_image_offset, distort_camera_points
 
 
 def test_zero_distortion_is_identity() -> None:

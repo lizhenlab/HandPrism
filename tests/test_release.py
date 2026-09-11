@@ -10,8 +10,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from dreamhand.architectures import CORE, FUSION, LEGACY_CORE_SHA256
-from dreamhand import release
+from handprism.architectures import CORE, FUSION, LEGACY_CORE_SHA256
+from handprism import release
 from scripts.train import load_config, load_trainable_state
 
 ROOT = Path(__file__).resolve().parents[1]

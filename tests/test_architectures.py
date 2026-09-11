@@ -14,18 +14,19 @@ import numpy as np
 import pytest
 import torch
 
-from dreamhand.architectures import (
+from handprism.architectures import (
     ARCHITECTURES, CORE, FUSION, CHECKPOINT_FORMAT, LEGACY_CORE_SHA256,
     add_architecture_argument, architecture_spec, validate_checkpoint_identity,
 )
-from dreamhand.attention import AlternatingLayer
-from dreamhand.config import DecoderConfig, SolverConfig
-from dreamhand.decoder import DreamHandDecoder
-from dreamhand.mano import ToyMano
-from dreamhand.model import DreamHandModel
-from dreamhand.system import DreamHandSystem
-from dreamhand.ray import fit_effective_pinhole_camera, normalized_pixel_grid
-from dreamhand.losses import camera_fit_bearing_loss
+from handprism.attention import AlternatingLayer
+from handprism.config import DecoderConfig, SolverConfig
+from handprism.decoder import HandPrismDecoder
+from handprism.mano import ToyMano
+from handprism.model import HandPrismModel
+from handprism.system import HandPrismSystem
+from handprism.fusion_runtime import fusion_config_from_json
+from handprism.ray import fit_effective_pinhole_camera, normalized_pixel_grid
+from handprism.losses import camera_fit_bearing_loss
 from scripts.infer import load_clip, predict_clip
 from scripts.evaluate import save_prediction
 from scripts.run_pipeline import Supervisor
@@ -53,7 +54,7 @@ def test_named_config_routes_real_architecture(architecture, solver):
     config = config_for(architecture, solver)
     assert set(config["dataset_weights"]) == {"arctic", "hot3d"}
     assert config["architecture_contract"] == architecture_spec(architecture).contract
-    model = DreamHandModel(ToyMano(), tiny_config(), architecture=architecture)
+    model = HandPrismModel(ToyMano(), tiny_config(), architecture=architecture)
     assert model.decoder.layers[0].joint_time_query == (architecture == FUSION)
     features = torch.randn(1, 3, 4, 4, 24, requires_grad=True)
     k = torch.tensor([[[80., 0, 64], [0, 80, 64], [0, 0, 1]]])
@@ -77,15 +78,14 @@ def test_explicit_selection_is_mandatory():
         with pytest.raises(SystemExit):
             parser.parse_args(arguments)
     with pytest.raises(TypeError):
-        DreamHandModel(ToyMano())
+        HandPrismModel(ToyMano())
     with pytest.raises(TypeError):
-        DreamHandDecoder()
+        HandPrismDecoder()
 
 
 @pytest.mark.parametrize("script", [
     "train.py", "evaluate.py", "run_pipeline.py", "check_readiness.py", "infer.py",
-    "train_three_dataset.py", "evaluate_three_dataset.py", "run_full_reproduction.py",
-    "audit_readiness.py", "audit_three_dataset_readiness.py",
+    "audit_readiness.py",
 ])
 def test_production_cli_refuses_omitted_architecture(script):
     result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / script)],
@@ -117,7 +117,13 @@ def archived_modules(archive, monkeypatch):
     modules = {}
     with tarfile.open(archive, "r:gz") as source:
         for name in ("config", "positional", "rotations", "attention", "decoder", "ray", "model"):
-            member = f"src/dreamhand/{name}.py"
+            candidates = [member for member in source.getmembers() if member.isfile()
+                          and Path(member.name).parts[:1] == ("src",)
+                          and len(Path(member.name).parts) == 3
+                          and Path(member.name).name == f"{name}.py"]
+            if len(candidates) != 1:
+                raise ValueError(f"archive must contain one source module for {name}")
+            member = candidates[0].name
             module = types.ModuleType(f"{package}.{name}")
             module.__package__ = package
             monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -139,10 +145,13 @@ def test_core_fp32_matches_actual_preserved_architecture(solver, archive, monkey
     modules = archived_modules(source, monkeypatch)
     old_config = modules["config"].DecoderConfig(feature_dim=24, hidden_dim=16, layers=2, heads=4, ffn_dim=32)
     torch.manual_seed(93)
-    old = modules["model"].DreamHandModel(ToyMano(), old_config).eval()
+    model_types = [value for value in vars(modules["model"]).values() if isinstance(value, type)
+                   and issubclass(value, torch.nn.Module) and value.__module__ == modules["model"].__name__]
+    assert len(model_types) == 1
+    old = model_types[0](ToyMano(), old_config).eval()
     # Exercise nonconstant ray fields rather than only the zero-init fallback.
     torch.nn.init.normal_(old.ray_head.projection.weight, std=0.01)
-    core = DreamHandModel(ToyMano(), tiny_config(), architecture=CORE).eval()
+    core = HandPrismModel(ToyMano(), tiny_config(), architecture=CORE).eval()
     core.load_state_dict(old.state_dict(), strict=True)
     features = torch.randn(1, 3, 4, 4, 24)
     kwargs = dict(target_frames=5, solver=solver,
@@ -244,7 +253,7 @@ def test_resume_architecture_is_checked_before_cuda_or_data(tmp_path, monkeypatc
     monkeypatch.setattr(training, "distributed_context", forbidden)
     monkeypatch.setattr(training, "make_loaders", forbidden)
     monkeypatch.setattr(sys, "argv", [
-        "train_three_dataset.py", "--architecture", FUSION,
+        "train.py", "--architecture", FUSION,
         "--config", "configs/handprism_fusion_standard.json",
         "--run-dir", "runs/architecture_preflight_never_written", "--resume", str(path),
     ])
@@ -288,10 +297,12 @@ def test_clip_inference_and_export_keep_selected_architecture(tmp_path, architec
 
     clip_path = tmp_path / "synthetic.npz"
     np.savez(clip_path, video=np.zeros((5, 64, 64, 3), dtype=np.uint8),
+             rgb_high=np.zeros((5, 128, 128, 3), dtype=np.uint8),
              intrinsics=np.array([[80, 0, 32], [0, 80, 32], [0, 0, 1]]))
     config = config_for(architecture, solver)
     batch = load_clip(clip_path, solver)
-    system = DreamHandSystem(SmallEncoder(), ToyMano(), tiny_config(), architecture=architecture).eval()
+    system = HandPrismSystem(SmallEncoder(), ToyMano(), tiny_config(), architecture=architecture,
+                            fusion_config=fusion_config_from_json(config)).eval()
     output, batch = predict_clip(system, torch.nn.Identity(), batch, config, torch.device("cpu"))
     destination = tmp_path / "prediction.npz"
     save_prediction(destination, output, batch, 20000, solver, architecture)

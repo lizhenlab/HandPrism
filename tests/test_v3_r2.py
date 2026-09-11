@@ -8,13 +8,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from dreamhand.config import DecoderConfig, SolverConfig
-from dreamhand.decoder import DreamHandDecoder
-from dreamhand.losses import camera_fit_bearing_loss, camera_fit_supervision, masked_clip_mean
-from dreamhand.mano import ToyMano, correct_left_shapedirs
-from dreamhand.model import DreamHandModel
-from dreamhand.paths import v3_run_path
-from dreamhand.ray import fit_effective_pinhole_camera, normalized_pixel_grid
+from handprism.config import DecoderConfig, SolverConfig
+from handprism.decoder import HandPrismDecoder
+from handprism.losses import camera_fit_bearing_loss, camera_fit_supervision, masked_clip_mean
+from handprism.mano import ToyMano, correct_left_shapedirs
+from handprism.model import HandPrismModel
+from handprism.paths import v3_run_path
+from handprism.ray import fit_effective_pinhole_camera, normalized_pixel_grid
 from scripts.train import decoder_config_from_json, load_config, restore_checkpoint
 
 
@@ -25,7 +25,7 @@ def tiny_config(**kwargs):
 @pytest.mark.parametrize("solver", ["standard", "kfree"])
 def test_amp_geometry_is_fp32_finite_and_differentiable(solver):
     torch.manual_seed(43)
-    model = DreamHandModel(ToyMano(), tiny_config(), architecture="handprism-fusion").eval()
+    model = HandPrismModel(ToyMano(), tiny_config(), architecture="handprism-fusion").eval()
     features = torch.randn(1, 3, 15, 21, 24, requires_grad=True)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         out = model(
@@ -106,7 +106,7 @@ def test_clip_reduction_masks_invalid_nan_and_keeps_empty_clip_zero():
 
 def test_calibration_cache_is_bounded_keyed_by_calibration_and_returns_copies():
     import numpy as np
-    from dreamhand.data.hot3d import _cached_ray_field, _RAY_FIELD_CACHE, RAY_GRID_SIZE
+    from handprism.data.hot3d import _cached_ray_field, _RAY_FIELD_CACHE, RAY_GRID_SIZE
 
     class Calibration:
         def __init__(self, focal):
@@ -138,8 +138,8 @@ def test_calibration_cache_is_bounded_keyed_by_calibration_and_returns_copies():
 
 def test_optional_anchor_offset_is_zero_initialized_and_cell_bounded():
     torch.manual_seed(7)
-    base = DreamHandDecoder(tiny_config(), architecture="handprism-fusion").eval()
-    refined = DreamHandDecoder(tiny_config(anchor_offset_cells=1), architecture="handprism-fusion").eval()
+    base = HandPrismDecoder(tiny_config(), architecture="handprism-fusion").eval()
+    refined = HandPrismDecoder(tiny_config(anchor_offset_cells=1), architecture="handprism-fusion").eval()
     missing, unexpected = refined.load_state_dict(base.state_dict(), strict=False)
     assert set(missing) == {"anchor_offset_head.weight", "anchor_offset_head.bias"}
     assert not unexpected
@@ -207,8 +207,8 @@ def test_old_v3_checkpoint_is_rejected_before_loading_parameters(tmp_path):
     path = tmp_path / "old-v3.pt"
     torch.save(
         {
-            "format": "ace-ego-hand-two-dataset-checkpoint-v3",
-            "implementation_id": "ace-ego-hand-independent-v3",
+            "format": "unsupported-training-checkpoint",
+            "implementation_id": "unsupported-implementation",
         },
         path,
     )
@@ -220,7 +220,7 @@ def test_old_v3_checkpoint_is_rejected_before_loading_parameters(tmp_path):
 
 def test_both_configs_select_conservative_ablation_defaults():
     root = Path(__file__).parents[1]
-    for name in ("two_dataset_v3.json", "two_dataset_kfree_v3.json"):
+    for name in ("handprism_fusion_b0_standard.json", "handprism_fusion_b0_kfree.json"):
         config = load_config(root / "configs" / name)
         assert config["loss_reduction"] == "per_clip"
         assert config["geometry_dtype"] == "float32"
@@ -232,8 +232,8 @@ def test_real_mano_pca_and_canonical_geometry_agree():
     asset = os.environ.get("MANO_MODEL_PATH")
     if not asset:
         pytest.skip("licensed MANO assets not configured")
-    from dreamhand.data.hot3d import _mano_layers, _geometry
-    from dreamhand.rotations import axis_angle_to_matrix
+    from handprism.data.hot3d import _mano_layers, _geometry
+    from handprism.rotations import axis_angle_to_matrix
 
     canonical, left, right = _mano_layers(asset)
     torch.testing.assert_close(left.shapedirs, canonical.left.shapedirs)

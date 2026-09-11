@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dreamhand.camera import project_fisheye624_upright
-from dreamhand.data.hot3d import IMAGE_SIZE, RGB_STREAM, UPRIGHT_FROM_SOURCE
+from handprism.camera import project_fisheye624_upright
+from handprism.data.hot3d import IMAGE_SIZE, RGB_STREAM, UPRIGHT_FROM_SOURCE
 
 
 def main() -> int:
@@ -19,7 +19,8 @@ def main() -> int:
     parser.add_argument(
         "--recording",
         type=Path,
-        default=Path("/data0/dataset/hot3d/P0001_10a27bf7"),
+        required=True,
+        help="HOT3D recording directory containing recording.vrs",
     )
     parser.add_argument("--samples", type=int, default=1000)
     args = parser.parse_args()

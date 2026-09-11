@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 import csv
 import hashlib
@@ -32,7 +36,8 @@ FULL_CAPABILITIES = (
     "existence",
     "visibility",
 )
-from dreamhand.data.policy import SUPPORTED_DATASETS, allowed_path
+from handprism.data.policy import SUPPORTED_DATASETS, allowed_path
+from handprism.data.schema import MANIFEST_SCHEMA
 
 
 def score(namespace: str, value: str) -> str:
@@ -378,7 +383,7 @@ def main() -> int:
             {row["recording_id"] for splits in all_records["hot3d"].values() for row in splits}
         )
     report: dict[str, Any] = {
-        "version": "dreamhand-dataset-mixture-v2-clean",
+        "version": MANIFEST_SCHEMA,
         "seed": SEED,
         "frames_per_window": FRAMES,
         "selected_datasets": list(selected),

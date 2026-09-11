@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 import hashlib
 import json
@@ -17,28 +21,29 @@ from torch import nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from dreamhand.backbone import (
+from handprism.backbone import (
     WanCleanLatentEncoder,
     WanFrozenVAEEncoder,
     load_official_vae,
     load_official_wan,
 )
-from dreamhand.data import DreamHandWindowDataset, collate_samples
-from dreamhand.evaluator import (
+from handprism.data import HandPrismWindowDataset, collate_samples
+from handprism.evaluator import (
     EvaluationAccumulator,
     score_batch,
     validate_metric_result,
 )
-from dreamhand.lora import configure_trainable_backbone, inject_wan_lora
-from dreamhand.mano import SmplxMano
-from dreamhand.paths import v3_run_path
-from dreamhand.system import DreamHandSystem
-from dreamhand.architectures import (
+from handprism.lora import configure_trainable_backbone, inject_wan_lora
+from handprism.mano import SmplxMano
+from handprism.paths import v3_run_path
+from handprism.system import HandPrismSystem
+from handprism.fusion_runtime import fusion_config_from_json, dataset_options, fusion_forward_options
+from handprism.architectures import (
     add_architecture_argument, architecture_spec, validate_checkpoint_identity, require_legacy_digest,
 )
-from dreamhand.data.policy import allowed_path
-from dreamhand.completion import require_finite_json
-from dreamhand.release import load_released_weights
+from handprism.data.policy import allowed_path
+from handprism.completion import require_finite_json
+from handprism.release import load_released_weights
 from scripts.train import (
     DistributedEvalSampler,
     load_config,
@@ -78,6 +83,8 @@ def save_prediction(
 ) -> None:
     metadata = {
         "format": "handprism-segment-prediction",
+        "metric_protocol_version": 2,
+        "timestamp_source": batch.get("timestamp_source"),
         "dataset": batch["dataset"],
         "recording_id": batch["recording_id"][0],
         "frame_start": int(batch["frame_indices"][0, 0]),
@@ -119,6 +126,16 @@ def save_prediction(
         "joints_root_direct": array(output.decoder.joints_root_direct),
         "ray_field": array(output.ray_field),
     }
+    for key in ("wrist_prior", "wrist_log_scale", "reliability_logits", "local_roi_valid", "local_roi_bounds", "anchor_quality"):
+        value = getattr(output.decoder, key, None)
+        if value is not None:
+            payload[key] = array(value)
+    for key in ("geometry_weight", "joint_weights"):
+        value = getattr(output.pnp, key, None)
+        if value is not None:
+            payload[key] = array(value)
+    if batch.get("timestamps") is not None:
+        payload["timestamps"] = batch["timestamps"][0].detach().cpu().double().numpy()
     if output.camera_fit is not None:
         payload.update(
             {
@@ -138,7 +155,7 @@ def save_prediction(
 
 def build_system(
     root: Path, config: dict[str, Any], device: torch.device, dtype: torch.dtype
-) -> tuple[DreamHandSystem, WanFrozenVAEEncoder]:
+) -> tuple[HandPrismSystem, WanFrozenVAEEncoder]:
     model_dir = resolve(root, config["model_dir"])
     videox_fun = resolve(root, config["videox_fun"])
     vae = load_official_vae(model_dir / "Wan2.2_VAE.pth", videox_fun, torch_dtype=dtype).to(device)
@@ -151,12 +168,13 @@ def build_system(
     encoder = WanCleanLatentEncoder(wan, gradient_checkpointing=False)
     mano = SmplxMano(resolve(root, config["mano_model"]), flat_hand_mean=True)
     return (
-        DreamHandSystem(
+        HandPrismSystem(
             encoder,
             mano,
             architecture=config["architecture"],
             decoder_config=decoder_config_from_json(config),
             solver_config=solver_config_from_json(config),
+            fusion_config=fusion_config_from_json(config),
         )
         .to(device)
         .eval(),
@@ -165,7 +183,7 @@ def build_system(
 
 
 @torch.no_grad()
-def canonical_joints(system: DreamHandSystem, device: torch.device) -> torch.Tensor:
+def canonical_joints(system: HandPrismSystem, device: torch.device) -> torch.Tensor:
     identity = torch.eye(3, device=device).view(1, 1, 1, 3, 3)
     global_rotation = identity.expand(1, 1, 2, 3, 3)
     articulation = identity.unsqueeze(-3).expand(1, 1, 2, 15, 3, 3)
@@ -243,10 +261,11 @@ def main() -> int:
     summaries: dict[str, dict[str, float | int | None]] = {}
     overall = EvaluationAccumulator()
     for dataset_name in datasets:
-        dataset = DreamHandWindowDataset(
+        dataset = HandPrismWindowDataset(
             manifest_root / f"{dataset_name}_test.jsonl",
             mano_model_path=mano_path,
             training=False,
+            **dataset_options(config, training=False),
         )
         sampler = DistributedEvalSampler(len(dataset), rank, world)
         loader = DataLoader(
@@ -284,7 +303,10 @@ def main() -> int:
                             camera_model=batch["camera_model"],
                             camera_parameters=batch["camera_parameters"],
                             source_image_size=batch["source_image_size"],
+                            **fusion_forward_options(config, batch),
                         )
+                    from handprism.training import scoring_batch
+                    batch = scoring_batch(batch, *output.ray_field.shape[1:3])
                     _, gt_vertices_root = system.hand.mano(
                         batch["global_rotation"],
                         batch["articulation"],
@@ -344,7 +366,8 @@ def main() -> int:
         overall_result = overall.finalize()
         validate_metric_result(overall_result)
         report = {
-            "format": "dreamhand-dataset-mixture-evaluation-v2-clean",
+            "format": "handprism-dataset-mixture-evaluation-v2-clean",
+            "metric_protocol_version": 2,
             "method": architecture_spec(args.architecture).display_name,
             "architecture": args.architecture,
             "implementation_id": architecture_spec(args.architecture).implementation_id,

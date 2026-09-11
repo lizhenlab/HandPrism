@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
-from dreamhand.camera import project_pinhole
-from dreamhand.evaluator import EvaluationAccumulator, score_batch
+from handprism.camera import project_pinhole
+from handprism.evaluator import EvaluationAccumulator, score_batch
 
 
 def test_perfect_detection_and_pose_scores_zero_error() -> None:
@@ -34,6 +34,7 @@ def test_perfect_detection_and_pose_scores_zero_error() -> None:
         joints_camera=joints_camera,
         joints_root_mano=joints_root,
         vertices_camera=vertices_root + translation.unsqueeze(-2),
+        vertices_root=vertices_root,
         pnp=SimpleNamespace(translation=translation),
         mano_translation=translation,
     )

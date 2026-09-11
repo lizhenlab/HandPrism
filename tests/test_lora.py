@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from dreamhand.lora import LoRALinear, inject_wan_lora, promote_trainable_parameters
+from handprism.lora import LoRALinear, inject_wan_lora, promote_trainable_parameters
 
 
 class Attention(nn.Module):

@@ -10,40 +10,34 @@ import tokenize
 
 import pytest
 
-from dreamhand.architectures import ARCHITECTURES, FUSION, architecture_spec
-from dreamhand.data.mixture import DEFAULT_DATASET_WEIGHTS, DatasetMixture
-from dreamhand.decoder import DreamHandDecoder
-from dreamhand.ray import RayHead
+from handprism.architectures import ARCHITECTURES, FUSION, architecture_spec
+from handprism.data.mixture import DEFAULT_DATASET_WEIGHTS, DatasetMixture
+from handprism.decoder import HandPrismDecoder
+from handprism.ray import RayHead
 from scripts.inspect_model import inspect_architecture
 from scripts.train import implementation_notes, load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("old,current", [
-    ("train_three_dataset", "train"),
-    ("evaluate_three_dataset", "evaluate"),
-    ("run_full_reproduction", "run_pipeline"),
-    ("audit_three_dataset_readiness", "check_readiness"),
-    ("build_three_dataset_manifests", "build_manifests"),
-])
-def test_legacy_entry_is_the_same_implementation(old, current):
-    legacy = importlib.import_module(f"scripts.{old}")
-    canonical = importlib.import_module(f"scripts.{current}")
-    assert legacy is canonical
+@pytest.mark.parametrize("entry", ["train", "evaluate", "run_pipeline", "check_readiness", "build_manifests"])
+def test_canonical_entrypoints_are_importable(entry):
+    canonical = importlib.import_module(f"scripts.{entry}")
+    assert callable(canonical.main)
+    assert Path(canonical.__file__).name == f"{entry}.py"
 
 
-def test_internal_function_aliases_preserve_callers():
-    from dreamhand import lora, ray
+def test_runtime_uses_descriptive_function_names():
+    from handprism import lora, ray
 
-    assert lora.freeze_backbone_except_paper_modules is lora.configure_trainable_backbone
-    assert ray.ace_kfree_bearings is ray.kfree_bearings
+    assert lora.configure_trainable_backbone.__name__ == "configure_trainable_backbone"
+    assert ray.kfree_bearings.__name__ == "kfree_bearings"
 
 
 @pytest.mark.parametrize("architecture", ARCHITECTURES)
 def test_parameter_report_counts_instantiated_components(architecture):
     report = inspect_architecture(architecture)
-    decoder = DreamHandDecoder(architecture=architecture)
+    decoder = HandPrismDecoder(architecture=architecture)
     ray = RayHead()
     assert report["architecture"] == architecture
     assert report["implementation_id"] == architecture_spec(architecture).implementation_id
@@ -72,7 +66,7 @@ def test_all_active_configs_and_default_mixture_have_only_two_sources():
 
 
 def test_retired_metadata_cannot_be_used_as_a_training_config():
-    path = ROOT / "configs/paper.json"
+    path = ROOT / "configs/components.json"
     value = json.loads(path.read_text())
     assert value["deprecated"] is True
     assert "datasets" not in value

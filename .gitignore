@@ -6,13 +6,17 @@ __pycache__/
 .DS_Store
 .env
 .env.*
+*.log
 /assets/
 /models/
 /third_party/
 /runs/
 /outputs/
 /data/
+/configs/local/
 /release_assets/
+/build/
+/dist/
 /preserved_v2/
 /preserved_v2_20260910/
 *.egg-info/

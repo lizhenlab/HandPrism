@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 import hashlib
 from importlib import metadata, util
@@ -24,14 +28,11 @@ MANO_SHA256 = {
     "LEFT": "c4022f7083f2ca7c78b2b3d595abbab52debd32b09d372b16923a801f0ea6a30",
     "RIGHT": "45d60aa3b27ef9107a7afd4e00808f307fd91111e1cfa35afd5c4a62de264767",
 }
-from dreamhand.data.policy import SUPPORTED_DATASETS, allowed_path, manifest_path, validate_record
-from dreamhand.architectures import CORE, add_architecture_argument, require_config_architecture
+from handprism.data.policy import SUPPORTED_DATASETS, allowed_path, manifest_path, validate_record
+from handprism.data.schema import supports_manifest_schema
+from handprism.architectures import CORE, add_architecture_argument, require_config_architecture
 
 SPLITS = ("train", "val", "test")
-MANIFEST_FORMATS = {
-    "dreamhand-three-dataset-v2-clean",
-    "dreamhand-dataset-mixture-v2-clean",
-}
 EXPECTED_WEIGHT_POLICIES = {
     ("arctic", "hot3d"): {"arctic": 0.4375, "hot3d": 0.5625},
 }
@@ -148,7 +149,7 @@ def audit_manifests(
     add_check(
         checks,
         "split_report_schema",
-        report.get("version") in MANIFEST_FORMATS and int(report.get("frames_per_window", 0)) == 81,
+        supports_manifest_schema(report.get("version")) and int(report.get("frames_per_window", 0)) == 81,
         {"path": str(split_path), "sha256": sha256(split_path)},
     )
     summary: dict[str, Any] = {}
@@ -326,9 +327,11 @@ def audit_config(
     checks: dict[str, dict[str, Any]],
     *, architecture: str | None = None,
 ) -> None:
-    config = json.loads(path.read_text())
+    config = json.loads(allowed_path(path).read_text())
     selected = architecture if architecture is not None else config.get("architecture")
     try:
+        from scripts.train import load_config
+        load_config(path, architecture=selected)
         require_config_architecture(config, selected)
         architecture_pass = True
     except ValueError:
@@ -351,8 +354,23 @@ def audit_config(
     configured_manifest = Path(config.get("manifests", ""))
     if not configured_manifest.is_absolute():
         configured_manifest = root / configured_manifest
+    allowed_path(configured_manifest)
     dataset_roots = config.get("dataset_roots", {})
     fit = config.get("kfree_camera_fit")
+    if selected != CORE and (config.get("hard_window_fraction", 0)
+                             or config.get("validation_selection") == "accuracy_coverage_v2"):
+        try:
+            from handprism.data.difficulty import validate_fusion_index
+            from handprism.data.dataset import read_jsonl
+            index_report = json.loads((configured_manifest / "split_report.json").read_text())
+            records = {name: {split: read_jsonl(configured_manifest / f"{name}_{split}.jsonl")
+                             for split in ("train", "val")} for name in datasets}
+            validate_fusion_index(index_report, records, config.get("validation_clips_per_dataset", 0))
+            index_ok = True
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            index_ok = False
+        add_check(checks, f"fusion_difficulty_index_{solver}", index_ok,
+                  "Requires index v2, nonoverlapping multiwindow full val larger than fast val; no test geometry")
     fit_config_pass = solver == "standard" and fit is None
     if solver == "kfree" and isinstance(fit, dict):
         try:
@@ -421,7 +439,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest-root",
         type=Path,
-        default=Path("data/manifests/two_dataset_v2_clean"),
+        help="default: infer from the supplied configs",
     )
     parser.add_argument(
         "--configs",
@@ -438,13 +456,20 @@ def main() -> int:
     args = parser.parse_args()
     root = args.root.resolve()
     checks: dict[str, dict[str, Any]] = {}
-    manifest_root = (
-        args.manifest_root if args.manifest_root.is_absolute() else root / args.manifest_root
-    )
     config_paths = [
         path if path.is_absolute() else root / path
         for path in (Path(name) for name in args.configs)
     ]
+    configured_roots = {str(json.loads(path.read_text())["manifests"]) for path in config_paths}
+    resolved_roots = {(Path(name) if Path(name).is_absolute() else root / name).resolve()
+                      for name in configured_roots}
+    if len(resolved_roots) != 1:
+        raise ValueError("configs must use the same frozen manifest directory")
+    manifest_root = resolved_roots.pop()
+    if args.manifest_root is not None:
+        explicit = args.manifest_root if args.manifest_root.is_absolute() else root / args.manifest_root
+        if explicit.resolve() != manifest_root:
+            raise ValueError("explicit manifest directory disagrees with configs")
     configured_sequences = [
         tuple(json.loads(path.read_text()).get("dataset_weights", {})) for path in config_paths
     ]
@@ -568,16 +593,20 @@ def main() -> int:
         {"free_bytes": free_bytes, "minimum_bytes": minimum_disk_bytes},
     )
     status = git_value(root, "status", "--porcelain")
+    repository = git_value(root, "rev-parse", "--show-toplevel")
+    own_repository = bool(repository) and Path(repository).resolve() == root.resolve()
+    committed = bool(git_value(root, "rev-parse", "HEAD")) if own_repository else False
     add_check(
         checks,
         "git_clean",
-        not status if args.require_clean_git else True,
-        {"required": args.require_clean_git, "status": status.splitlines()},
+        own_repository and committed and not status if args.require_clean_git else True,
+        {"required": args.require_clean_git, "own_repository": own_repository,
+         "committed": committed, "status": status.splitlines()},
     )
 
     ready = all(value["pass"] for value in checks.values())
     output = {
-        "format": "dreamhand-dataset-mixture-readiness-v2-clean",
+        "format": "handprism-dataset-mixture-readiness-v2-clean",
         "architecture": args.architecture,
         "ready": ready,
         "datasets": list(datasets),

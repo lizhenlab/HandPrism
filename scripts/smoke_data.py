@@ -12,11 +12,11 @@ import time
 
 import torch
 
-from dreamhand.data import DreamHandWindowDataset
-from dreamhand.data.contract import DreamHandSample, validate_sample
+from handprism.data import HandPrismWindowDataset
+from handprism.data.contract import HandPrismSample, validate_sample
 
 
-def audit_sample(sample: DreamHandSample, elapsed: float) -> dict[str, object]:
+def audit_sample(sample: HandPrismSample, elapsed: float) -> dict[str, object]:
     validate_sample(sample)
     nonfinite: dict[str, int] = {}
     for field in fields(sample):
@@ -71,7 +71,7 @@ def main() -> int:
     mano_model = args.mano_model if args.mano_model.is_absolute() else root / args.mano_model
     torch.manual_seed(260820308)
     for name in args.datasets:
-        dataset = DreamHandWindowDataset(
+        dataset = HandPrismWindowDataset(
             manifest_root / f"{name}_{args.split}.jsonl",
             mano_model_path=mano_model,
             training=args.split == "train",

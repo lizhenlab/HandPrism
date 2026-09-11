@@ -4,22 +4,22 @@ import math
 
 import torch
 
-from dreamhand.camera import project_fisheye624_upright, project_pinhole
-from dreamhand.config import DecoderConfig, DreamHandConfig, SolverConfig
-from dreamhand.decoder import DreamHandDecoder
-from dreamhand.mano import ToyMano
-from dreamhand.metrics import jitter_matched_runs, procrustes_mpjpe
-from dreamhand.model import DreamHandModel
-from dreamhand.losses import (
-    DreamHandLoss,
-    DreamHandPrediction,
-    DreamHandTarget,
+from handprism.camera import project_fisheye624_upright, project_pinhole
+from handprism.config import DecoderConfig, HandPrismConfig, SolverConfig
+from handprism.decoder import HandPrismDecoder
+from handprism.mano import ToyMano
+from handprism.metrics import jitter_matched_runs, procrustes_mpjpe
+from handprism.model import HandPrismModel
+from handprism.losses import (
+    HandPrismLoss,
+    HandPrismPrediction,
+    HandPrismTarget,
     camera_fit_bearing_loss,
     camera_fit_warmup_factor,
     masked_mean,
 )
-from dreamhand.positional import RayPE
-from dreamhand.ray import (
+from handprism.positional import RayPE
+from handprism.ray import (
     RayHead,
     kfree_bearings,
     bearings_from_effective_camera,
@@ -29,11 +29,11 @@ from dreamhand.ray import (
     normalized_pixel_grid,
     undistort_bearings,
 )
-from dreamhand.rotations import geodesic_distance, rotation_6d_to_matrix
+from handprism.rotations import geodesic_distance, rotation_6d_to_matrix
 
 
 def test_component_config_contract() -> None:
-    config = DreamHandConfig()
+    config = HandPrismConfig()
     config.validate()
     assert config.decoder.queries == 48
     assert config.latent_frames == 21
@@ -215,7 +215,7 @@ def test_joint_only_capability_does_not_train_mano_derived_losses() -> None:
     camera = camera.expand(batch, frames, hands, joints, 3).clone()
     camera[..., 2] += 1.0
     ray = torch.tensor([0.0, 0.0, 1.0]).expand(batch, 2, 2, 3).clone()
-    prediction = DreamHandPrediction(
+    prediction = HandPrismPrediction(
         global_rotation=identity,
         articulation=articulation,
         betas=torch.zeros(batch, hands, 10),
@@ -228,7 +228,7 @@ def test_joint_only_capability_does_not_train_mano_derived_losses() -> None:
         visibility_logits=torch.zeros(batch, frames, hands),
         ray_field=torch.tensor([1.0, 0.0, 0.0]).expand_as(ray).clone(),
     )
-    target = DreamHandTarget(
+    target = HandPrismTarget(
         global_rotation=identity,
         articulation=articulation,
         betas=torch.zeros(batch, frames, hands, 10),
@@ -245,7 +245,7 @@ def test_joint_only_capability_does_not_train_mano_derived_losses() -> None:
         valid_joints_2d=torch.zeros(batch, frames, hands, joints, dtype=torch.bool),
         valid_ray=torch.zeros(batch, 2, 2, dtype=torch.bool),
     )
-    losses = DreamHandLoss()(
+    losses = HandPrismLoss()(
         prediction,
         target,
         torch.eye(3).unsqueeze(0),
@@ -300,7 +300,7 @@ def tiny_decoder_config() -> DecoderConfig:
 
 
 def test_decoder_shapes_and_heatmap_normalization() -> None:
-    decoder = DreamHandDecoder(tiny_decoder_config(), architecture="handprism-fusion")
+    decoder = HandPrismDecoder(tiny_decoder_config(), architecture="handprism-fusion")
     features = torch.randn(2, 3, 4, 5, 32)
     rays = torch.randn(2, 4, 5, 3)
     output = decoder(features, rays, target_frames=9)
@@ -315,7 +315,7 @@ def test_decoder_shapes_and_heatmap_normalization() -> None:
 
 
 def test_full_tiny_model_backward() -> None:
-    model = DreamHandModel(ToyMano(), tiny_decoder_config(), architecture="handprism-fusion")
+    model = HandPrismModel(ToyMano(), tiny_decoder_config(), architecture="handprism-fusion")
     features = torch.randn(1, 3, 4, 5, 32, requires_grad=True)
     output = model(
         features,
@@ -332,7 +332,7 @@ def test_full_tiny_model_backward() -> None:
 
 
 def test_full_tiny_kfree_model_exposes_camera_fit() -> None:
-    model = DreamHandModel(ToyMano(), tiny_decoder_config(), architecture="handprism-fusion")
+    model = HandPrismModel(ToyMano(), tiny_decoder_config(), architecture="handprism-fusion")
     output = model(
         torch.randn(1, 3, 4, 5, 32),
         target_frames=5,

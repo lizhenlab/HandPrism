@@ -8,6 +8,10 @@ not loaded. Results and small diagnostic tensors are written to a new output.
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 import json
 from pathlib import Path
@@ -17,20 +21,20 @@ from PIL import Image, ImageDraw
 import torch
 import torch.nn.functional as F
 
-from dreamhand.camera import project_camera
-from dreamhand.config import DecoderConfig
-from dreamhand.data import DreamHandWindowDataset, collate_samples
-from dreamhand.data.policy import SUPPORTED_DATASETS
-from dreamhand.decoder import DreamHandDecoder
-from dreamhand.ray import (
+from handprism.camera import project_camera
+from handprism.config import DecoderConfig
+from handprism.data import HandPrismWindowDataset, collate_samples
+from handprism.data.policy import SUPPORTED_DATASETS
+from handprism.decoder import HandPrismDecoder
+from handprism.ray import (
     kfree_bearings,
     bearings_from_intrinsics,
     mixed_pnp,
     project_kfree,
     sample_ray_bearings,
 )
-from dreamhand.training import target_from_batch
-from dreamhand.completion import require_finite_json
+from handprism.training import target_from_batch
+from handprism.completion import require_finite_json
 from scripts.train import load_config, manifest_report
 from scripts.check_readiness import audit_manifests, audit_config
 
@@ -72,7 +76,7 @@ def render_overfit(path: Path, frame, truth, before, after, valid):
 
 
 def run(root: Path, output: Path, iterations: int, *, architecture: str) -> dict:
-    from dreamhand.architectures import require_config_architecture
+    from handprism.architectures import require_config_architecture
     from scripts.train import solver_config_from_json
 
     if torch.cuda.is_initialized():
@@ -101,7 +105,7 @@ def run(root: Path, output: Path, iterations: int, *, architecture: str) -> dict
     }
     for name in SUPPORTED_DATASETS:
         started = time.perf_counter()
-        dataset = DreamHandWindowDataset(
+        dataset = HandPrismWindowDataset(
             manifest_root / f"{name}_train.jsonl",
             mano_model_path=root / config["mano_model"],
             training=True,
@@ -172,7 +176,7 @@ def run(root: Path, output: Path, iterations: int, *, architecture: str) -> dict
         assert geometry["standard"]["solved_eligible_hand_frames"] > 0
         geometry["oracle_pinhole_fit_accepted"] = bool(fit.valid[0])
         geometry["oracle_fit_rms_normalized"] = float(fit.rms_normalized[0])
-        model = DreamHandDecoder(
+        model = HandPrismDecoder(
             DecoderConfig(feature_dim=32, hidden_dim=64, layers=2, heads=4, ffn_dim=128),
             architecture=architecture,
         )
@@ -256,7 +260,7 @@ def run(root: Path, output: Path, iterations: int, *, architecture: str) -> dict
 
 
 if __name__ == "__main__":
-    from dreamhand.architectures import add_architecture_argument
+    from handprism.architectures import add_architecture_argument
 
     parser = argparse.ArgumentParser(description=__doc__)
     add_architecture_argument(parser)

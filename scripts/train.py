@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 from contextlib import nullcontext
 import hashlib
@@ -26,32 +30,39 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Sampler
 
-from dreamhand.backbone import (
+from handprism.backbone import (
     WanCleanLatentEncoder,
     WanFrozenVAEEncoder,
     load_official_vae,
     load_official_wan,
 )
-from dreamhand.config import DecoderConfig, OptimizerConfig, SolverConfig
-from dreamhand.data import DreamHandWindowDataset, collate_samples
-from dreamhand.data.policy import SUPPORTED_DATASETS, allowed_path, manifest_path, validate_record
-from dreamhand.architectures import (
+from handprism.config import DecoderConfig, OptimizerConfig, SolverConfig
+from handprism.fusion_runtime import (fusion_config_from_json, loss_weights_from_json,
+    dataset_options, fusion_forward_options, validation_selection_score, weighted_loss_audit, ddp_options,
+    training_diagnostics, decoder_gradient_norms)
+from handprism.data import HandPrismWindowDataset, collate_samples
+from handprism.data.dataset import read_jsonl
+from handprism.data.difficulty import stratified_order, validation_rank_limit, validate_fusion_index
+from handprism.data.policy import SUPPORTED_DATASETS, allowed_path, manifest_path, validate_record
+from handprism.data.schema import MANIFEST_SCHEMA, supports_manifest_schema
+from handprism.architectures import (
     CORE, FUSION, CONTRACT_VERSION, CHECKPOINT_FORMAT, add_architecture_argument,
     architecture_spec, require_config_architecture, validate_checkpoint_identity,
 )
-from dreamhand.evaluator import EvaluationAccumulator, score_batch, validate_metric_result
-from dreamhand.lora import (
+from handprism.evaluator import EvaluationAccumulator, score_batch, validate_metric_result
+from handprism.lora import (
     configure_trainable_backbone,
     inject_wan_lora,
     promote_trainable_parameters,
 )
-from dreamhand.losses import DreamHandLoss, camera_fit_supervision
-from dreamhand.mano import SmplxMano
-from dreamhand.paths import v3_run_path
-from dreamhand.system import DreamHandSystem
-from dreamhand.training import (
+from handprism.losses import HandPrismLoss, camera_fit_supervision
+from handprism.mano import SmplxMano
+from handprism.paths import v3_run_path
+from handprism.system import HandPrismSystem
+from handprism.training import (
     build_optimizer,
     prediction_from_output,
+    scoring_batch,
     target_from_batch,
     trainable_parameter_report,
     warmup_cosine,
@@ -81,13 +92,10 @@ LOSS_NAMES = (
     "acceleration",
     "ray",
     "camera_fit",
+    "joints_root_mano", "direct_mano_consistency", "wrist_prior", "reliability",
+    "log_depth",
+    "velocity_error", "acceleration_error", "wrist_velocity_error", "wrist_acceleration_error",
 )
-MANIFEST_FORMATS = {
-    "dreamhand-three-dataset-v2-clean",
-    "dreamhand-dataset-mixture-v2-clean",
-}
-
-
 def distributed_context() -> tuple[int, int, int, torch.device]:
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -109,6 +117,11 @@ def seed_everything(seed: int, rank: int) -> None:
 
 def load_config(path: Path, *, architecture: str | None = None) -> dict[str, Any]:
     value = json.loads(allowed_path(path).read_text())
+    return validate_config(value, architecture=architecture)
+
+
+def validate_config(value: dict[str, Any], *, architecture: str | None = None) -> dict[str, Any]:
+    """Validate before writing generated configurations or touching run state."""
     required = {
         "seed",
         "solver",
@@ -120,6 +133,9 @@ def load_config(path: Path, *, architecture: str | None = None) -> dict[str, Any
     missing = required - value.keys()
     if missing:
         raise ValueError(f"training config is missing {sorted(missing)}")
+    for key in ("steps", "batch_size_per_gpu", "gradient_accumulation", "validate_every", "checkpoint_every"):
+        if key in value and (type(value[key]) is not int or value[key] <= 0):
+            raise ValueError(f"{key} must be a positive integer")
     weights = value["dataset_weights"]
     if not isinstance(weights, dict) or not weights:
         raise ValueError("dataset_weights must be a non-empty object")
@@ -184,6 +200,28 @@ def load_config(path: Path, *, architecture: str | None = None) -> dict[str, Any
     if set(value.get("decoder", {})) != {"anchor_offset_cells"}:
         raise ValueError("decoder must explicitly declare anchor_offset_cells")
     decoder_config_from_json(value)
+    fusion_config_from_json(value)
+    loss_weights_from_json(value)
+    solver_config_from_json(value)
+    if selected == FUSION:
+        if not isinstance(value.get("fusion"), dict):
+            raise ValueError("Fusion requires explicit fusion settings")
+        policy = value.get("validation_selection", "legacy_mean_loss")
+        if policy not in {"legacy_mean_loss", "accuracy_coverage_v2"}:
+            raise ValueError("unknown validation selection policy")
+        if policy == "accuracy_coverage_v2":
+            limit = value.get("validation_clips_per_dataset")
+            if type(limit) is not int or limit <= 0 or "validation_batches_per_dataset" in value:
+                raise ValueError("Fusion requires a positive global validation_clips_per_dataset, not a per-rank budget")
+            interval = value.get("full_validate_every", 0)
+            if type(interval) is not int or interval <= 0 or interval % int(value["validate_every"]) or interval % int(value["checkpoint_every"]):
+                raise ValueError("full validation must coincide with validation/checkpoint boundaries")
+        fraction = value.get("hard_window_fraction", 0.)
+        if type(fraction) not in (int, float) or not 0 <= fraction <= .5:
+            raise ValueError("hard_window_fraction must be in [0,.5]")
+        dataset_options(value, training=True)
+    elif value.get("geometry_refinement") or value.get("augmentation") or value.get("hard_window_fraction"):
+        raise ValueError("Core data/solver settings must remain unchanged")
     if selected == CORE and value["decoder"]["anchor_offset_cells"] != 0:
         raise ValueError("HandPrism-Core does not support anchor offsets")
     if weights != {"arctic": 0.4375, "hot3d": 0.5625}:
@@ -208,6 +246,9 @@ def solver_config_from_json(config: dict[str, Any]) -> SolverConfig:
     """Construct the selected architecture's geometric solver and fit guards."""
 
     fit = config.get("kfree_camera_fit", {})
+    geometry = config.get("geometry_refinement", {})
+    if set(geometry) - {"robust_iterations", "robust_huber_px", "depth_refine_fraction"}:
+        raise ValueError("unknown geometry refinement setting")
     return SolverConfig(
         architecture=config.get("architecture", FUSION),
         camera_fit_variance_floor=float(fit.get("variance_floor", 1e-4)),
@@ -215,6 +256,7 @@ def solver_config_from_json(config: dict[str, Any]) -> SolverConfig:
         camera_fit_focal_max=float(fit.get("focal_max", 10.0)),
         camera_fit_max_rms_normalized=float(fit.get("max_rms_normalized", 0.01)),
         camera_fit_target=str(fit.get("target", "pinhole_compatible")),
+        **geometry,
     )
 
 
@@ -329,20 +371,27 @@ def make_loaders(
     dict[str, DistributedEvalSampler],
 ]:
     manifest_root = resolve(root, config["manifests"])
+    if config.get("validation_selection") == "accuracy_coverage_v2" or config.get("hard_window_fraction", 0):
+        audit = manifest_report(manifest_root, tuple(config["dataset_weights"]))
+        records = {name: {split: read_jsonl(manifest_root / f"{name}_{split}.jsonl")
+                         for split in ("train", "val")} for name in config["dataset_weights"]}
+        validate_fusion_index(audit["split_report"], records, config.get("validation_clips_per_dataset", 0))
     mano = resolve(root, config["mano_model"])
     workers = int(config.get("num_workers", 2))
     train_loaders, train_samplers = {}, {}
     val_loaders, val_samplers = {}, {}
     for name in config["dataset_weights"]:
-        train_dataset = DreamHandWindowDataset(
+        train_dataset = HandPrismWindowDataset(
             manifest_root / f"{name}_train.jsonl",
             mano_model_path=mano,
             training=True,
+            **dataset_options(config, training=True),
         )
-        val_dataset = DreamHandWindowDataset(
+        val_dataset = HandPrismWindowDataset(
             manifest_root / f"{name}_val.jsonl",
             mano_model_path=mano,
             training=False,
+            **dataset_options(config, training=False),
         )
         train_sampler = DeterministicDrawBatchSampler(
             len(train_dataset),
@@ -352,6 +401,8 @@ def make_loaders(
             int(config["seed"]),
             name,
         )
+        if config.get("validation_selection") == "accuracy_coverage_v2":
+            val_dataset.records = [val_dataset.records[i] for i in stratified_order(val_dataset.records)]
         val_sampler = DistributedEvalSampler(len(val_dataset), rank, world)
         train_loaders[name] = DataLoader(
             train_dataset,
@@ -468,6 +519,7 @@ def save_checkpoint(
     torch.save(
         {
             "format": CHECKPOINT_FORMAT,
+            "contract_version": CONTRACT_VERSION,
             "architecture": config["architecture"],
             "implementation_id": architecture_spec(config["architecture"]).implementation_id,
             "step": step,
@@ -582,6 +634,14 @@ def source_tree_sha256(root: Path) -> str:
 
 
 def git_fingerprint(root: Path) -> dict[str, Any]:
+    repository = git_value(root, "rev-parse", "--show-toplevel")
+    if not repository or Path(repository).resolve() != root.resolve():
+        # A source snapshot inside an ignored run directory is not the parent
+        # checkout. Its identity is the source/config hashes in the contract.
+        return {
+            "commit": None, "dirty": None, "dirty_diff_sha256": None,
+            "untracked_files": [], "scope": "unversioned-source-snapshot",
+        }
     diff = subprocess.run(
         ["git", "diff", "--binary", "HEAD", "--"],
         cwd=root,
@@ -614,6 +674,7 @@ def git_fingerprint(root: Path) -> dict[str, Any]:
         digest.update(b"\0")
         digest.update(value.encode())
     return {
+        "scope": "workspace-repository",
         "commit": git_value(root, "rev-parse", "HEAD"),
         "dirty": bool(diff or files),
         "dirty_diff_sha256": digest.hexdigest(),
@@ -649,7 +710,7 @@ def manifest_report(manifest_root: Path, datasets: tuple[str, ...]) -> dict[str,
         raise ValueError("only the ARCTIC/HOT3D manifest set is allowed")
     split_path = manifest_root / "split_report.json"
     report = json.loads(split_path.read_text())
-    if report.get("version") not in MANIFEST_FORMATS:
+    if not supports_manifest_schema(report.get("version")):
         raise RuntimeError("training requires the v2_clean data contract")
     expected_datasets = set(datasets)
     reported_datasets = set(report.get("datasets", {}))
@@ -670,18 +731,21 @@ def manifest_report(manifest_root: Path, datasets: tuple[str, ...]) -> dict[str,
     manifests: dict[str, Any] = {}
     identities: dict[str, dict[str, set[str]]] = {}
     split_groups: dict[str, dict[str, set[str]]] = {}
+    records: dict[str, dict[str, list[dict]]] = {name: {} for name in datasets}
     for path in sorted(manifest_root.glob("*.jsonl")):
         manifest_path(path)
         dataset, split = path.stem.rsplit("_", 1)
         rows = 0
         recording_ids: set[str] = set()
         group_ids: set[str] = set()
+        records[dataset][split] = []
         with path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
                 record = json.loads(line)
                 validate_record(record, path)
+                records[dataset][split].append(record)
                 rows += 1
                 recording_ids.add(str(record["recording_id"]))
                 group_ids.add(str(record["split_group"]))
@@ -716,8 +780,15 @@ def manifest_report(manifest_root: Path, datasets: tuple[str, ...]) -> dict[str,
             or splits["val"] & splits["test"]
         ):
             raise RuntimeError(f"split-group leakage detected in {dataset}")
+    # Normalize only the in-memory report; retain the digest of the original
+    # file for provenance and never rewrite source manifests during an audit.
+    source_schema_sha256 = hashlib.sha256(report["version"].encode()).hexdigest()
+    report["version"] = MANIFEST_SCHEMA
+    if "fusion_index" in report:
+        validate_fusion_index(report, records)
     return {
         "split_report_sha256": sha256(split_path),
+        "source_schema_sha256": source_schema_sha256,
         "split_report": report,
         "manifests": manifests,
     }
@@ -759,6 +830,12 @@ def implementation_notes(config: dict[str, Any]) -> list[str]:
         f"Decoder uses {decoder.heads} attention heads and FFN width {decoder.ffn_dim}",
         "Wan features use the official 32x backbone spatial compression",
     ]
+    if config["architecture"] == FUSION:
+        notes.extend([
+            "Fusion modules, native RGB detail, motion objectives and sampling are explicit ablations",
+            "Timestamp-aware motion uses valid intervals only; unknown occlusion is not a negative label",
+            "Only full validation may select accuracy_coverage_v2 best checkpoints; test never selects",
+        ])
     if config["solver"] == "kfree":
         fit = config["kfree_camera_fit"]
         notes.append(
@@ -774,7 +851,7 @@ def write_contract(
     run_dir: Path,
     config: dict[str, Any],
     world: int,
-    system: DreamHandSystem,
+    system: HandPrismSystem,
     optimizer: torch.optim.Optimizer,
     *,
     allow_existing: bool,
@@ -824,7 +901,10 @@ def write_contract(
         "method": architecture_spec(config["architecture"]).display_name,
         "geometry_dtype": "float32",
         "loss_reduction": "per_clip",
-        "data_geometry_contract": "hot3d-pca-and-canonical-left-shapedirs-consistent-r2",
+        "data_geometry_contract": ("fusion-r4-safe-targets-log-depth-discrete-roi"
+                                   if config["architecture"] == FUSION else
+                                   "hot3d-pca-and-canonical-left-shapedirs-consistent-r2"),
+        "metric_protocol_version": 2,
         "metric_translation": "CT=MANO-native-translation; Wrist=J0+translation",
         # The isolated server copy is inside an ignored runs/ directory. Its
         # parent's clean Git status alone does not identify its actual code.
@@ -864,7 +944,7 @@ def write_contract(
     }
     stable_payload = json.dumps(stable, sort_keys=True, separators=(",", ":"))
     contract = {
-        "format": "dreamhand-run-contract-v2",
+        "format": "handprism-run-contract-v2",
         "created_unix": time.time(),
         "hostname": socket.gethostname(),
         "command": sys.argv,
@@ -902,7 +982,7 @@ def write_contract(
 def validate(
     system: nn.Module,
     vae_encoder: WanFrozenVAEEncoder,
-    criterion: DreamHandLoss,
+    criterion: HandPrismLoss,
     loaders: dict[str, DataLoader],
     config: dict[str, Any],
     device: torch.device,
@@ -919,6 +999,11 @@ def validate(
         torch.zeros(1, 1, 2, 10, device=device),
     )
     maximum = int(config.get("validation_batches_per_dataset", 8))
+    if config.get("validation_selection") == "accuracy_coverage_v2":
+        maximum = validation_rank_limit(config["validation_clips_per_dataset"],
+                                        dist.get_rank() if world > 1 else 0, world)
+    elif maximum == 0:
+        maximum = None
     for name, loader in loaders.items():
         loss_sums = torch.zeros(len(LOSS_NAMES), device=device)
         summary = torch.zeros(4, device=device)
@@ -927,9 +1012,8 @@ def validate(
         accumulator = EvaluationAccumulator()
         extrema = torch.tensor([float("inf"), float("-inf"), 0.0], device=device)
         nonfinite = torch.zeros(4, device=device)
-        for index, host_batch in enumerate(loader):
-            if index >= maximum:
-                break
+        from itertools import islice
+        for host_batch in islice(loader, maximum):
             batch = move_batch(host_batch, device)
             video = batch["video"].to(dtype)
             latent = vae_encoder(video)
@@ -947,6 +1031,7 @@ def validate(
                     camera_model=batch["camera_model"],
                     camera_parameters=batch["camera_parameters"],
                     source_image_size=batch["source_image_size"],
+                    **fusion_forward_options(config, batch),
                 )
                 prediction = prediction_from_output(output)
                 target = target_from_batch(
@@ -971,6 +1056,7 @@ def validate(
                     ),
                     camera_fit_config=solver_config_from_json(config),
                 )
+            batch = scoring_batch(batch, *output.ray_field.shape[1:3])
             distance = (prediction.joints_root_direct.float() - batch["joints_root"]).norm(dim=-1)
             mask = batch["valid_joints_3d"].float()
             mano_mask = mask * batch["valid_mano"].float().unsqueeze(-1)
@@ -1068,6 +1154,7 @@ def validate(
         for key, value in dataset_metrics.items():
             result[f"val/{name}/test_protocol/{key}"] = value
         count = summary[2].clamp_min(1)
+        result[f"val/{name}/windows"] = int(summary[2].cpu())
         for term_index, term in enumerate(LOSS_NAMES):
             result[f"val/{name}/{term}"] = float((loss_sums[term_index] / count).cpu())
         result[f"val/{name}/direct_root_mpjpe_mm"] = float(
@@ -1137,7 +1224,12 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     config = load_config(resolve(root, str(args.config)), architecture=args.architecture)
     if args.steps is not None:
+        if "ablation" in config:
+            raise ValueError("regenerate ablation clip budget instead of overriding --steps")
         config["steps"] = args.steps
+        validate_config(config, architecture=args.architecture)
+    if "ablation" in config and config["ablation"]["world_size"] != int(os.environ.get("WORLD_SIZE", "1")):
+        raise ValueError("world size disagrees with the frozen ablation exposure budget")
     identity = {"architecture": args.architecture, "implementation_id": config["implementation_id"]}
     run_dir = v3_run_path(root, args.run_dir)
     resume_path: Path | None = None
@@ -1171,14 +1263,15 @@ def main() -> int:
         wan, gradient_checkpointing=bool(config.get("gradient_checkpointing", True))
     )
     mano = SmplxMano(resolve(root, config["mano_model"]), flat_hand_mean=True)
-    system = DreamHandSystem(
+    system = HandPrismSystem(
         encoder,
         mano,
         architecture=args.architecture,
         decoder_config=decoder_config_from_json(config),
         solver_config=solver_config_from_json(config),
+        fusion_config=fusion_config_from_json(config),
     ).to(device)
-    criterion = DreamHandLoss().to(device)
+    criterion = HandPrismLoss(loss_weights_from_json(config), fusion_config_from_json(config)).to(device)
     optimizer_config = OptimizerConfig(
         steps=int(config["steps"]),
         warmup_steps=int(config.get("warmup_steps", 200)),
@@ -1223,8 +1316,7 @@ def main() -> int:
             system,
             device_ids=[device.index],
             output_device=device.index,
-            broadcast_buffers=False,
-            static_graph=True,
+            **ddp_options(config),
         )
     else:
         system_wrapped = system
@@ -1288,8 +1380,10 @@ def main() -> int:
         )
     try:
         for step in range(start_step + 1, final_step + 1):
+            selection_improved = False
             started = time.perf_counter()
             term_sums: dict[str, Tensor] = {}
+            diagnostic_sums: dict[str, Tensor] = {}
             camera_fit_valid_sum = torch.zeros((), device=device)
             camera_fit_activity_sum = torch.zeros(3, device=device)
             dataset_counts = {name: 0 for name in config["dataset_weights"]}
@@ -1322,6 +1416,7 @@ def main() -> int:
                         camera_model=batch["camera_model"],
                         camera_parameters=batch["camera_parameters"],
                         source_image_size=batch["source_image_size"],
+                        **fusion_forward_options(config, batch, training=True, step=step),
                     )
                     prediction = prediction_from_output(output)
                     target = target_from_batch(
@@ -1366,7 +1461,16 @@ def main() -> int:
                         term_sums.get(name, torch.zeros_like(value.detach()))
                         + value.detach() / accumulation
                     )
+                if config["architecture"] == FUSION:
+                    for name, value in training_diagnostics(output, batch).items():
+                        diagnostic_sums[name] = diagnostic_sums.get(name, torch.zeros_like(value)) + value / accumulation
                 del video, latent, output, prediction, target, losses
+            diagnostic_values = {}
+            if config["architecture"] == FUSION and step % int(config.get("log_every", 1)) == 0:
+                diagnostic_sums.update(decoder_gradient_norms(system.hand.decoder))
+                reduced = reduce_mean(torch.stack(list(diagnostic_sums.values())), world)
+                if rank == 0:
+                    diagnostic_values = dict(zip(diagnostic_sums, reduced.cpu().tolist()))
             trainable = [parameter for parameter in system.parameters() if parameter.requires_grad]
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 trainable, float(config.get("gradient_clip", 1.0)), error_if_nonfinite=True
@@ -1385,6 +1489,8 @@ def main() -> int:
                     "grad_norm": float(reduce_mean(grad_norm, world).cpu()),
                     "max_cuda_gib": torch.cuda.max_memory_allocated(device) / 2**30,
                     "datasets": dataset_counts,
+                    "global_clips_seen": step * world * int(config["batch_size_per_gpu"]) * accumulation,
+                    "global_frames_seen": step * world * int(config["batch_size_per_gpu"]) * accumulation * 81,
                     "lr": {
                         group.get("name", str(index)): group["lr"]
                         for index, group in enumerate(optimizer.param_groups)
@@ -1416,6 +1522,10 @@ def main() -> int:
                     }
                 )
                 assert log_handle is not None
+                if config["architecture"] == FUSION:
+                    row["fusion_diagnostics"] = diagnostic_values
+                    row["loss_audit"] = weighted_loss_audit(
+                        {name: row[f"loss/{name}"] for name in term_sums}, config, step)
                 log_handle.write(json.dumps(row, sort_keys=True) + "\n")
                 log_handle.flush()
                 print(json.dumps(row, sort_keys=True), flush=True)
@@ -1441,23 +1551,35 @@ def main() -> int:
                         reduce_mean(value, world)
 
             if step % int(config.get("validate_every", 500)) == 0 or step == final_step:
+                modern_selection = config.get("validation_selection") == "accuracy_coverage_v2"
+                full_validation = modern_selection and (
+                    step % int(config["full_validate_every"]) == 0 or step == configured_final_step)
+                validation_config = dict(config)
+                if full_validation:
+                    validation_config["validation_clips_per_dataset"] = 0
                 metrics = validate(
                     system_wrapped,
                     vae_encoder,
                     criterion,
                     val_loaders,
-                    config,
+                    validation_config,
                     device,
                     world,
                     dtype,
                 )
                 if rank == 0:
+                    metrics["val/full_validation"] = full_validation
+                    selection_score = (validation_selection_score(metrics) if full_validation
+                                       else metrics["val/mean_loss"] if not modern_selection else None)
+                    metrics["val/selection_score"] = selection_score
+                    selection_improved = selection_score is not None and selection_score < best_validation
+                    if selection_improved:
+                        best_validation = selection_score
                     row = {**identity, "type": "validation", "step": step, "time_unix": time.time(), **metrics}
                     assert log_handle is not None
                     log_handle.write(json.dumps(row, sort_keys=True) + "\n")
                     log_handle.flush()
                     print(json.dumps(row, sort_keys=True), flush=True)
-                    best_validation = min(best_validation, metrics["val/mean_loss"])
                     if step >= 500:
                         for dataset in SUPPORTED_DATASETS:
                             issues = [
@@ -1503,6 +1625,14 @@ def main() -> int:
                         config,
                         rng_by_rank,
                     )
+                    if selection_improved:
+                        atomic_json(run_dir / "checkpoints" / "best.json", {
+                            **identity, "step": step, "path": path.name,
+                            "score": best_validation,
+                            "selection": config.get("validation_selection", "legacy_mean_loss"),
+                            "metric_protocol_version": 2,
+                            "full_validation": full_validation,
+                        })
                     print(
                         json.dumps({**identity, "type": "checkpoint", "step": step, "path": str(path)}),
                         flush=True,

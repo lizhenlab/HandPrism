@@ -1,0 +1,11 @@
+{
+  "deprecated": true,
+  "purpose": "Component metadata only; select an explicit architecture configuration to train",
+  "use_configs": [
+    "configs/handprism_core_standard.json",
+    "configs/handprism_core_kfree.json",
+    "configs/handprism_fusion_standard.json",
+    "configs/handprism_fusion_kfree.json"
+  ],
+  "component_defaults": "src/handprism/config.py"
+}

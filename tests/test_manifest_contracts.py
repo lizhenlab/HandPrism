@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dreamhand.data.dataset import DreamHandWindowDataset
+from handprism.data.dataset import HandPrismWindowDataset
 from scripts.build_manifests import (
     FRAMES,
     HOT3D_REQUIRED_MASKS,
@@ -30,8 +30,9 @@ def test_fixed_starts_honor_nonzero_valid_bounds() -> None:
 
 
 def test_dataset_draw_never_crosses_hot3d_invalid_gap() -> None:
-    dataset = DreamHandWindowDataset.__new__(DreamHandWindowDataset)
+    dataset = HandPrismWindowDataset.__new__(HandPrismWindowDataset)
     dataset.training = True
+    dataset.hard_window_fraction = 0.
     dataset.frames = FRAMES
     record = {"valid_ranges": [[0, 100], [150, 250]]}
     starts = {dataset._start(record, draw_seed) for draw_seed in range(40)}

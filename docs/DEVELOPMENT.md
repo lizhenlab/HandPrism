@@ -6,8 +6,9 @@
 
 1. 使用 Wan 视频特征。保留预训练 VAE 的归一化与视频主干整体 32 倍的空间步幅，不修改 patch kernel 来改变网格。
 2. Decoder 在 `[T × Q]` 查询流上进行双向时间交互，RoPE 只编码帧时间；寄存器、关节与手部 query 可以交换信息，不写回视觉 memory。
-3. Direct-joint head 在 latent 时刻预测三维坐标，再插值到 RGB 帧；不对已插值特征做额外非线性坐标回归。
-4. MANO 提供参数化手形，ray 场和 Mixed-PnP 用于相机空间定位。投影阈值使用真实像素单位，并记录失败和回退状态。
+3. 全局 direct-joint head 在 latent 时刻预测三维坐标，再插值到 RGB 帧。可选最终 readout 使用最后一次时空更新后的 joint queries 再读空间 memory。
+4. 可选局部支路从原始 RGB 裁剪逐帧 ROI，给全局坐标、anchors 和姿态增加零初始化残差；可选 joint-MANO 头将逐关节证据送入姿态残差。
+5. MANO 提供参数化手形，ray 场和 Mixed-PnP 用于相机空间定位。可选独立时序腕点先验与监督质量权重参与融合；投影阈值使用真实像素单位，并保留失败和回退状态。
 
 Core 使用相同的视觉主干接口，但各 query 独立沿时间交互，direct-joint 在插值后的隐特征上回归坐标；PnP 保留 bearing 误差乘图像对角线的历史代理，不能标作真实像素误差。Core 不启用边缘 residual head。上述差异由架构分支实际执行，不只是命名不同。
 
@@ -36,11 +37,11 @@ Core 也支持两种 solver，但其 K-free 拟合只应用方差、有限参数
 
 ## Fusion 的可选实验开关
 
-以下功能已实现，但默认不启用替代策略。使用固定训练/验证片段先做单变量对照，测试集不参与选择。
+六项模块、损失、采样、增强均已开关化；详见 [Fusion r4 实施与消融](FUSION_R4.md)。完整候选配置启用六项，B0 全部关闭。使用同一固定训练/验证划分先做单变量对照，测试集不参与选择。以下相机替代监督仍为独立实验。
 
 ### 边缘 anchor 修正
 
-`decoder.anchor_offset_cells` 默认为 0；可选 0.5/1.0 cell 的零初始化、有界 residual head，允许 anchor 超出网格中心的凸包。
+`decoder.anchor_offset_cells` 在组件/B0 中为 0，在完整候选中为 1.0；可选 0.5/1.0 cell 的零初始化、有界 residual head，允许 anchor 超出网格中心的凸包。`fusion.edge_quality` 使用完整 feature-cell 边缘带降低观测权重；与硬有效性检查分别记录、分别消融。
 
 该 head 只扩展定位表达范围，不解决 K-free 在边界处的 ray 逆映射歧义，仍须保留求解器有效性检查。它是否改善边缘手形和出画误检，须经验证。
 
@@ -74,13 +75,13 @@ bash scripts/v3_python.sh scripts/make_v3_ablation.py \
 
 ## 标识与兼容性
 
-项目名与发行包名为 HandPrism / `handprism`，当前 Python 导入名仍为 `dreamhand`。当前机器可读标识为：
+项目名为 HandPrism，发行包名和 Python 导入名统一为 `handprism`，项目类名使用 `HandPrism*`。当前机器可读标识为：
 
 - 架构：`handprism-core` / `handprism-fusion`，所有模型入口均须显式选择。
-- 实现 ID：`handprism-core-r1` / `handprism-fusion-r2`。
-- 运行契约版本：8。
+- 实现 ID：`handprism-core-r1` / `handprism-fusion-r4`。
+- 运行契约版本：9，指标协议版本：2。
 - checkpoint 格式：`handprism-training-checkpoint`，同时记录架构与完整配置。
 
 CLI、配置、模型实例与 checkpoint 架构必须一致；不能依赖同形状参数猜测前向逻辑。两份保留的 Core 最终权重只允许经 SHA-256 校验的显式 legacy 推理/评测入口读取，不接入新优化器状态。新 Core 与 Fusion 实验均需冻结配置并从独立的 step 0 运行开始；新的同契约 checkpoint 可以恢复。原源码、权重与许可保持原状，历史格式标识仅用于归档、兼容识别或拒绝旧格式的回归测试。
 
-评测计数、漏检惩罚与单位见[评测口径](EVALUATION.md)。参数诊断 `scripts/inspect_model.py --architecture ...` 只报告实际实例化的默认 decoder/ray head 参数量，不把主干或 LoRA 的外部估计当作实测值。
+评测计数、漏检惩罚与单位见[评测口径](EVALUATION.md)。参数诊断 `scripts/inspect_model.py --architecture ... --config ...` 报告所选配置实际实例化的 decoder/ray head 参数量；省略配置只报告组件基础默认，不把主干或 LoRA 的外部估计当作实测值。

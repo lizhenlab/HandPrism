@@ -18,7 +18,7 @@ bash scripts/bootstrap_backbone.sh
 
 ## 数据准备
 
-只使用 ARCTIC/HOT3D。六份配置的 `dataset_roots` 使用相对路径 `data/arctic`、`data/hot3d`；按自己的数据位置修改或链接。ARCTIC 根目录应包含 `data/meta`、`data/raw_seqs`、`data/images`；HOT3D 根目录应包含对应 `P*_*` recording、VRS、标注和 masks。
+只使用 ARCTIC/HOT3D。有效配置的 `dataset_roots` 使用相对路径 `data/arctic`、`data/hot3d`；按自己的数据位置修改或链接。ARCTIC 根目录应包含 `data/meta`、`data/raw_seqs`、`data/images`；HOT3D 根目录应包含对应 `P*_*` recording、VRS、标注和 masks。
 
 ```bash
 bash scripts/v3_python.sh scripts/build_manifests.py \
@@ -27,6 +27,33 @@ bash scripts/v3_python.sh scripts/build_manifests.py \
 ```
 
 构建器针对 README 中声明的数据版本和完整数量，不是任意数据子集的通用划分器。准备好完整数据后再执行；不覆盖已经冻结的清单。划分和连续有效区间规则见代码，数据的许可和访问手续由使用者自行办理。
+
+### 已有数据搬到新的挂载点
+
+软链接或 `dataset_roots` 配置不会自动覆盖清单每一行中保存的绝对路径。已有冻结划分时，不需要重新解压、复制数据或重新随机划分；可生成只调整根路径的新清单：
+
+```bash
+bash scripts/v3_python.sh scripts/relocate_manifests.py \
+  --source data/manifests/two_dataset_v2_clean \
+  --output data/manifests/two_dataset_relocated \
+  --arctic-root data/arctic --hot3d-root data/hot3d
+```
+
+ARCTIC 根目录必须直接包含 `data/{meta,raw_seqs,images}`，不一定是解压挂载的最外层。工具先验证旧清单哈希及数据契约，再检查新路径下每个 recording 所需文件；只更新 `root` / `recording_root` 和对应文件摘要，保持记录顺序、划分、窗口、有效区间、能力标识与其他字段不变。它不解码 train/val/test 图像或几何，也不搬移原始数据。输出必须不存在；原清单只读保留，新报告记录来源摘要。中断后的不完整输出不能通过 readiness。
+
+将本机配置副本放在已忽略的 `configs/local/`，令 Core 的 `manifests` 指向新清单，并填写对应数据根目录。公开 Core 配置与权重身份保持不变。随后运行正常 readiness，不能用 `--skip-data-files` 作为数据迁移完成的证据。
+
+Fusion 仍须在路径更新后的基础清单上单独生成下述 r4 索引；不能把普通清单改名来冒充困难窗口索引。本机 Fusion/B0 配置应共同指向同一份完整 r4 索引。
+
+Fusion r4 在原划分上另建索引；Core 不使用新索引和增强。该步骤读取 train/val 几何、逐字节复制 test 清单，不读取 test RGB 或 test 标注几何、不改变划分：
+
+```bash
+bash scripts/v3_python.sh scripts/prepare_fusion_index.py \
+  --source data/manifests/two_dataset_v2_clean \
+  --output data/manifests/two_dataset_fusion_r4 --mano-model assets/body_models/mano
+```
+
+输出目录须不存在；索引版本为 2，所有六份清单重新校验 SHA-256。train 保存候选困难窗口，val 扩展为每 recording 最多 12 个固定、不重叠、兼顾时间与分层的窗口（`--val-windows-per-recording`），同一 held-out recording/participant 不换组。HOT3D 仅从 val recording 的原 required masks 恢复有效区间并核对统计；test 保持字节相同。旧版单窗口索引会被拒绝，不能只修改版本号。失败保留临时目录供诊断，不覆盖旧数据。耗时取决于标注数量与 VRS 元数据 I/O。未准备索引时不要启动完整 Fusion 候选。
 
 ## 训练、验证、完整测试
 
@@ -38,7 +65,11 @@ bash scripts/v3_python.sh scripts/check_readiness.py --architecture handprism-fu
 bash scripts/v3_python.sh scripts/run_pipeline.py --architecture handprism-fusion
 ```
 
-顺序为 readiness → train_standard（20,000 step）→ evaluate_standard → train_kfree（20,000 step）→ evaluate_kfree → complete。每 500 step 先验证再保存 checkpoint。不同架构分别使用 `runs/handprism_{core,fusion}_{full,standard,kfree}`，不得混用 state、checkpoint 和 metrics。
+顺序为 readiness → train_standard（20,000 step）→ evaluate_standard → train_kfree（20,000 step）→ evaluate_kfree → complete。每 500 step 小验证、保存 checkpoint；Fusion 每 2,000 step 及最终 step 完整验证，只有完整验证能更新 `checkpoints/best.json`。完整流程仍固定评测 step 20000，不能把 best 与 final 的成绩混报。
+
+Fusion 快速验证使用 `validation_clips_per_dataset=16`（全局预算，所有 GPU 合计），完整验证读取冻结 val 的所有窗口，两者日志均记录实际数量。Core 保留原每 rank 验证预算。训练日志包含独立 `loss/log_depth`、几何/先验融合比例、ROI 覆盖率与分支梯度诊断；loss 权重不等于梯度贡献。
+
+Core 默认目录为 `runs/handprism_core_{full,standard,kfree}`，Fusion 为 `runs/handprism_fusion_r4_{full,standard,kfree}`。清单目录从两份配置共同推导；不一致、旧实现 control state 或其他架构目录会拒绝继续。不得混用 state、checkpoint 和 metrics。先做 B0 和短程单项消融，具体命令见 [Fusion 指南](FUSION_R4.md)；完整流程不是短程筛选入口。
 
 独立训练示例见 [README](../README.md)。Core 完整测试示例：
 

@@ -1,0 +1,486 @@
+"""HandPrism metrics with missed-detection penalties and visibility strata."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+import math
+
+import torch
+from torch import Tensor
+
+from .camera import project_camera
+from .metrics import (
+    aligned_iou,
+    dilate_boxes,
+    global_orientation_error,
+    jitter_matched_run_sum_count,
+    masked_procrustes_mpjpe,
+    masked_wrist_aligned_mpjpe,
+    on_screen_from_projection,
+    projected_boxes,
+)
+from .model import HandPrismOutput
+from .motion import motion_errors
+
+METRIC_PROTOCOL_VERSION = 2
+STRATA = ("edge", "small", "fast", "oos", "occluded",
+          "oos_within_clip_le0p5s", "oos_within_clip_0p5_1s", "oos_within_clip_gt1s")
+QUALITY_THRESHOLDS = (0.25, 0.5, 0.75, 0.9)
+EXTENDED_METRICS = {
+    "AnchorEPE_px": "anchor",
+    "MANOReprojectionEPE_px": "mano_reprojection",
+    "CameraMPJPE_mm": "camera_mpjpe",
+    "WristAbsolute_mm": "wrist_absolute",
+    "DepthAbsolute_mm": "depth_absolute",
+    "RootPVE_mm": "root_pve",
+    "CameraPVE_mm": "camera_pve",
+    "RootVelocityError_m_s": "root_velocity",
+    "RootAccelerationError_m_s2": "root_acceleration",
+    "WristVelocityError_m_s": "wrist_velocity",
+    "WristAccelerationError_m_s2": "wrist_acceleration",
+    "ExistenceCoverage": "existence_coverage",
+    "QualityTargetMAE": "quality_mae",
+    "WristPriorNLL": "prior_nll",
+    "WristPrior95AxisCoverage": "prior_95_coverage",
+    "WristPriorScale_m": "prior_scale",
+    "WristPriorConfidentFailureRate": "prior_confident_failure",
+}
+
+
+STATE_KEYS = (
+    "segments",
+    "frames",
+    "correct_frames",
+    "true_positive",
+    "false_positive",
+    "false_negative",
+    "penalty_hands",
+    "mpjpe_penalty_sum_mm",
+    "pa_penalty_sum_mm",
+    "epe_hands",
+    "epe_penalty_sum_px",
+    "ct_hands",
+    "ct_penalty_sum_m",
+    "wrist_penalty_sum_m",
+    "go_hands",
+    "go_penalty_sum_deg",
+    "matched_hands",
+    "matched_mpjpe_sum_mm",
+    "jitter_sum_mm",
+    "jitter_count",
+    "all_hand_frames",
+    "all_mpjpe_sum_mm",
+    "iv_hand_frames",
+    "iv_mpjpe_sum_mm",
+    "oos_hand_frames",
+    "oos_mpjpe_sum_mm",
+)
+STATE_KEYS += tuple(f"{key}_{suffix}" for key in EXTENDED_METRICS.values() for suffix in ("sum", "count"))
+STATE_KEYS += tuple(f"{stratum}_{key}" for stratum in STRATA
+                    for key in ("count", "root_sum_mm", "camera_sum_mm", "wrist_sum_mm", "depth_sum_mm", "active_count"))
+STATE_KEYS += ("quality_population", "oos_within_clip_runs", "oos_censored_runs")
+STATE_KEYS += tuple(f"quality_{threshold}_{key}" for threshold in QUALITY_THRESHOLDS
+                    for key in ("count", "error_sum_px"))
+STATE_KEYS += tuple(f"quality_bin_{index}_{key}" for index in range(5)
+                    for key in ("count", "prediction_sum", "target_sum"))
+
+
+@dataclass
+class EvaluationAccumulator:
+    values: dict[str, float] = field(default_factory=lambda: {key: 0.0 for key in STATE_KEYS})
+
+    def add(self, key: str, value: float | int | Tensor) -> None:
+        if key not in self.values:
+            raise KeyError(key)
+        self.values[key] += float(value)
+
+    def as_tensor(self, device: torch.device) -> Tensor:
+        return torch.tensor(
+            [self.values[key] for key in STATE_KEYS], device=device, dtype=torch.float64
+        )
+
+    def load_tensor(self, value: Tensor) -> None:
+        for key, item in zip(STATE_KEYS, value.detach().cpu().tolist()):
+            self.values[key] = float(item)
+
+    def finalize(self) -> dict[str, float | int | None]:
+        value = self.values
+
+        def ratio(numerator: str, denominator: str) -> float | None:
+            count = value[denominator]
+            return value[numerator] / count if count else None
+
+        precision_denominator = value["true_positive"] + value["false_positive"]
+        recall_denominator = value["true_positive"] + value["false_negative"]
+        precision = value["true_positive"] / precision_denominator if precision_denominator else 0.0
+        recall = value["true_positive"] / recall_denominator if recall_denominator else 0.0
+        f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+        result = {
+            "metric_protocol_version": METRIC_PROTOCOL_VERSION,
+            "segments": int(value["segments"]),
+            "frames": int(value["frames"]),
+            "true_positive": int(value["true_positive"]),
+            "false_positive": int(value["false_positive"]),
+            "false_negative": int(value["false_negative"]),
+            "FAcc": ratio("correct_frames", "frames"),
+            "Precision": precision,
+            "Recall": recall,
+            "F1": f1,
+            "MPJPE-p_mm": ratio("mpjpe_penalty_sum_mm", "penalty_hands"),
+            "PA-p_mm": ratio("pa_penalty_sum_mm", "penalty_hands"),
+            "EPE2D-p_px": ratio("epe_penalty_sum_px", "epe_hands"),
+            "GO-p_deg": ratio("go_penalty_sum_deg", "go_hands"),
+            "CT-p_m": ratio("ct_penalty_sum_m", "ct_hands"),
+            "Wrist-p_m": ratio("wrist_penalty_sum_m", "ct_hands"),
+            "Jitter_mm_per_frame2": ratio("jitter_sum_mm", "jitter_count"),
+            "MPJPE-matched_mm": ratio("matched_mpjpe_sum_mm", "matched_hands"),
+            "MPJPE-IV_mm": ratio("iv_mpjpe_sum_mm", "iv_hand_frames"),
+            "MPJPE-OOS_mm": ratio("oos_mpjpe_sum_mm", "oos_hand_frames"),
+            "MPJPE+OOS_mm": ratio("all_mpjpe_sum_mm", "all_hand_frames"),
+            "IV_hand_frames": int(value["iv_hand_frames"]),
+            "OOS_hand_frames": int(value["oos_hand_frames"]),
+        }
+        for name, prefix in EXTENDED_METRICS.items():
+            result[name] = ratio(f"{prefix}_sum", f"{prefix}_count")
+            result[f"{name}_count"] = int(value[f"{prefix}_count"])
+        for stratum in STRATA:
+            for metric, prefix in (("RootMPJPE_mm", "root_sum_mm"), ("CameraMPJPE_mm", "camera_sum_mm"),
+                                   ("WristAbsolute_mm", "wrist_sum_mm"), ("DepthAbsolute_mm", "depth_sum_mm"),
+                                   ("ExistenceCoverage", "active_count")):
+                result[f"{stratum}/{metric}"] = ratio(f"{stratum}_{prefix}", f"{stratum}_count")
+            result[f"{stratum}/count"] = int(value[f"{stratum}_count"])
+        for threshold in QUALITY_THRESHOLDS:
+            result[f"quality_at_{threshold}/coverage"] = ratio(f"quality_{threshold}_count", "quality_population")
+            result[f"quality_at_{threshold}/AnchorEPE_px"] = ratio(f"quality_{threshold}_error_sum_px", f"quality_{threshold}_count")
+            result[f"quality_at_{threshold}/count"] = int(value[f"quality_{threshold}_count"])
+        calibration_error = sum(abs(value[f"quality_bin_{i}_prediction_sum"] -
+                                    value[f"quality_bin_{i}_target_sum"]) for i in range(5))
+        result["QualitySoftECE"] = calibration_error / value["quality_population"] if value["quality_population"] else None
+        result["OOS_within_clip_runs"] = int(value["oos_within_clip_runs"])
+        result["OOS_censored_runs"] = int(value["oos_censored_runs"])
+        return result
+
+
+def oos_duration_masks(oos: Tensor, timestamps: Tensor, valid_hand: Tensor) -> tuple[dict[str, Tensor], int, int]:
+    """Observed duration inside this clip only; boundary runs are censored.
+
+    No cross-window association or guessed FPS. Duplicates/gaps split runs.
+    A one-frame run has an observed time span of zero, not an invented period.
+    """
+    names = STRATA[-3:]
+    masks = {name: torch.zeros_like(oos) for name in names}
+    visible = oos.detach().cpu().bool()
+    valid = valid_hand.detach().cpu().bool()
+    clocks = timestamps.detach().double().cpu()
+    runs = censored = 0
+    for b in range(oos.shape[0]):
+        times = clocks[b]
+        good = torch.isfinite(times.diff()) & (times.diff() > 1e-6) & (times.diff() <= .15)
+        for side in range(oos.shape[2]):
+            start = 0
+            while start < oos.shape[1]:
+                if not visible[b, start, side]:
+                    start += 1
+                    continue
+                stop = start + 1
+                while stop < oos.shape[1] and visible[b, stop, side] and good[stop-1]:
+                    stop += 1
+                if not torch.isfinite(times[start:stop]).all():
+                    start = stop
+                    continue
+                duration = float(times[stop-1] - times[start])
+                name = names[0 if duration <= .5 else 1 if duration <= 1. else 2]
+                masks[name][b, start:stop, side] = True
+                runs += 1
+                censored += int(start == 0 or stop == oos.shape[1] or
+                                not good[start-1] or not good[stop-1] or
+                                not valid[b, start-1, side] or not valid[b, stop, side])
+                start = stop
+    return masks, runs, censored
+
+
+def _camera_kwargs(batch: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "distortion": batch["distortion"],
+        "camera_model": batch["camera_model"],
+        "camera_parameters": batch["camera_parameters"],
+        "source_image_size": batch["source_image_size"],
+    }
+
+
+def _selected_sum(value: Tensor, mask: Tensor, scale: float = 1.0) -> float:
+    return float(torch.where(mask, value, torch.zeros_like(value)).sum().double().cpu()) * scale
+
+
+@torch.no_grad()
+def score_batch(
+    accumulator: EvaluationAccumulator,
+    output: HandPrismOutput,
+    batch: Mapping[str, object],
+    gt_vertices_root: Tensor,
+    canonical_joints: Tensor,
+    *,
+    solver: str,
+    gt_mano_translation: Tensor,
+) -> None:
+    """Accumulate detection, pose and motion metrics for one dataset batch.
+
+    Ground-truth calibration is used for scoring both camera modes; the
+    K-free model branch ignores it. Legacy EPE retains its solver-dependent
+    source; the two explicit v2 EPE metrics have identical solver definitions.
+    """
+
+    from .data.policy import require_dataset
+
+    require_dataset(str(batch["dataset"]))
+    intrinsics = batch["intrinsics"]
+    image_size = batch["image_size"]
+    if not isinstance(intrinsics, Tensor) or not isinstance(image_size, Tensor):
+        raise TypeError("camera tensors are missing")
+    camera = _camera_kwargs(batch)
+    gt_joints_camera = batch["joints_camera"]
+    gt_joints_root = batch["joints_root"]
+    valid_hand = batch["valid_hand"].bool()
+    valid_mano = batch["valid_mano"].bool()
+    valid_3d = batch["valid_joints_3d"].bool() & valid_hand.unsqueeze(-1)
+    valid_2d = batch["valid_joints_2d"].bool() & valid_hand.unsqueeze(-1)
+    if not isinstance(gt_joints_camera, Tensor) or not isinstance(gt_joints_root, Tensor):
+        raise TypeError("joint tensors are missing")
+
+    gt_projected = project_camera(
+        gt_joints_camera,
+        intrinsics,
+        image_size,
+        **camera,  # type: ignore[arg-type]
+    )
+    pred_projected = project_camera(
+        output.joints_camera,
+        intrinsics,
+        image_size,
+        **camera,  # type: ignore[arg-type]
+    )
+    active = output.decoder.existence_logits.sigmoid() > 0.5
+
+    gt_on_screen = valid_hand & on_screen_from_projection(gt_joints_camera, gt_projected, valid_3d)
+    pred_on_screen = on_screen_from_projection(output.joints_camera, pred_projected)
+    candidate = active & pred_on_screen
+    gt_box_points = gt_vertices_root + batch["translation"].unsqueeze(-2)
+    pred_box_points = output.vertices_camera
+    gt_boxes = projected_boxes(
+        gt_box_points,
+        intrinsics,
+        image_size,
+        valid=None,
+        **camera,  # type: ignore[arg-type]
+    )
+    pred_boxes = projected_boxes(
+        pred_box_points,
+        intrinsics,
+        image_size,
+        valid=None,
+        **camera,  # type: ignore[arg-type]
+    )
+    overlap = aligned_iou(pred_boxes, dilate_boxes(gt_boxes, 0.10))
+    matched = gt_on_screen & candidate & torch.isfinite(overlap) & (overlap > 0.0)
+    false_negative = gt_on_screen & ~matched
+    false_positive = candidate & ~matched
+    detection_matched = matched
+    detection_false_negative = false_negative
+    detection_false_positive = false_positive
+
+    accumulator.add("segments", gt_joints_camera.shape[0])
+    accumulator.add("frames", gt_joints_camera.shape[0] * gt_joints_camera.shape[1])
+    accumulator.add(
+        "correct_frames",
+        (~(detection_false_negative | detection_false_positive).any(-1)).sum(),
+    )
+    accumulator.add("true_positive", detection_matched.sum())
+    accumulator.add("false_positive", detection_false_positive.sum())
+    accumulator.add("false_negative", detection_false_negative.sum())
+    accumulator.add("penalty_hands", gt_on_screen.sum())
+
+    canonical = canonical_joints.to(gt_joints_root).view(1, 1, 2, 21, 3).expand_as(gt_joints_root)
+    predicted_root = output.joints_root_mano
+    mpjpe = masked_wrist_aligned_mpjpe(predicted_root.float(), gt_joints_root.float(), valid_3d)
+    canonical_mpjpe = masked_wrist_aligned_mpjpe(
+        canonical.float(), gt_joints_root.float(), valid_3d
+    )
+    pa = masked_procrustes_mpjpe(predicted_root.float(), gt_joints_root.float(), valid_3d)
+    canonical_pa = masked_procrustes_mpjpe(canonical.float(), gt_joints_root.float(), valid_3d)
+    accumulator.add(
+        "mpjpe_penalty_sum_mm",
+        _selected_sum(mpjpe, matched, 1000.0)
+        + _selected_sum(canonical_mpjpe, false_negative, 1000.0),
+    )
+    accumulator.add(
+        "pa_penalty_sum_mm",
+        _selected_sum(pa, matched, 1000.0) + _selected_sum(canonical_pa, false_negative, 1000.0),
+    )
+    accumulator.add("matched_hands", matched.sum())
+    accumulator.add("matched_mpjpe_sum_mm", _selected_sum(mpjpe, matched, 1000.0))
+
+    if solver == "standard":
+        predicted_2d = output.decoder.anchors_2d.float()
+    elif solver == "kfree":
+        predicted_2d = pred_projected
+    else:
+        raise ValueError("solver must be standard or kfree")
+    pixel_scale = torch.stack((image_size[:, 1], image_size[:, 0]), dim=-1)
+    pixel_scale = pixel_scale[:, None, None, None]
+    joint_epe = ((predicted_2d - batch["joints_2d"]) * pixel_scale).norm(dim=-1)
+    visible_count = valid_2d.sum(-1).clamp_min(1)
+    epe = torch.where(valid_2d, joint_epe, 0.).sum(-1) / visible_count
+    diagonal = image_size.square().sum(-1).sqrt()[:, None, None].expand_as(epe)
+    epe_population = gt_on_screen & valid_2d.any(-1)
+    epe_matched = matched & epe_population
+    epe_missed = false_negative & epe_population
+    accumulator.add("epe_hands", epe_population.sum())
+    accumulator.add(
+        "epe_penalty_sum_px",
+        _selected_sum(epe, epe_matched) + _selected_sum(diagonal, epe_missed),
+    )
+
+    ct = (output.mano_translation.float() - gt_mano_translation.float()).norm(dim=-1)
+    canonical_ct = gt_mano_translation.float().norm(dim=-1)
+    wrist = (output.pnp.translation.float() - batch["translation"].float()).norm(dim=-1)
+    ct_population = gt_on_screen & valid_mano
+    ct_matched = matched & ct_population
+    ct_missed = false_negative & ct_population
+    accumulator.add("ct_hands", ct_population.sum())
+    accumulator.add(
+        "ct_penalty_sum_m",
+        _selected_sum(ct, ct_matched) + _selected_sum(canonical_ct, ct_missed),
+    )
+    accumulator.add(
+        "wrist_penalty_sum_m",
+        _selected_sum(wrist, ct_matched)
+        + _selected_sum(batch["translation"].float().norm(dim=-1), ct_missed),
+    )
+    go_population = gt_on_screen & valid_mano
+    go_matched = matched & valid_mano
+    go_missed = false_negative & valid_mano
+    go = global_orientation_error(
+        output.decoder.global_rotation.float(), batch["global_rotation"].float()
+    )
+    identity = torch.eye(3, device=go.device).expand_as(batch["global_rotation"])
+    canonical_go = global_orientation_error(identity, batch["global_rotation"].float())
+    accumulator.add("go_hands", go_population.sum())
+    accumulator.add(
+        "go_penalty_sum_deg",
+        _selected_sum(go, go_matched) + _selected_sum(canonical_go, go_missed),
+    )
+
+    all_hand = valid_hand
+    oos = all_hand & ~gt_on_screen
+    iv = all_hand & gt_on_screen
+    accumulator.add("all_hand_frames", all_hand.sum())
+    accumulator.add("all_mpjpe_sum_mm", _selected_sum(mpjpe, all_hand, 1000.0))
+    accumulator.add("iv_hand_frames", iv.sum())
+    accumulator.add("iv_mpjpe_sum_mm", _selected_sum(mpjpe, iv, 1000.0))
+    accumulator.add("oos_hand_frames", oos.sum())
+    accumulator.add("oos_mpjpe_sum_mm", _selected_sum(mpjpe, oos, 1000.0))
+
+    # v2 metrics use identical definitions for both solvers. Legacy EPE2D-p
+    # remains above for historical comparisons and must not be renamed silently.
+    def add_metric(prefix: str, error: Tensor, mask: Tensor, scale: float = 1.):
+        accumulator.add(f"{prefix}_sum", _selected_sum(error, mask, scale))
+        accumulator.add(f"{prefix}_count", mask.sum())
+
+    anchor_error = ((output.decoder.anchors_2d - batch["joints_2d"]) * pixel_scale).norm(dim=-1)
+    reprojection_error = ((pred_projected - batch["joints_2d"]) * pixel_scale).norm(dim=-1)
+    reprojection_error = torch.where(output.joints_camera[..., 2] > .01, reprojection_error, diagonal[..., None])
+    add_metric("anchor", anchor_error, valid_2d)
+    add_metric("mano_reprojection", reprojection_error, valid_2d & valid_mano[..., None])
+    camera_error = (output.joints_camera - gt_joints_camera).norm(dim=-1)
+    add_metric("camera_mpjpe", camera_error, valid_3d & valid_mano[..., None], 1000.)
+    wrist_error = camera_error[..., 0]
+    depth_error = (output.joints_camera[..., 0, 2] - gt_joints_camera[..., 0, 2]).abs()
+    wrist_valid = valid_3d[..., 0] & valid_mano
+    add_metric("wrist_absolute", wrist_error, wrist_valid, 1000.)
+    add_metric("depth_absolute", depth_error, wrist_valid, 1000.)
+    add_metric("root_pve", (output.vertices_root - gt_vertices_root).norm(dim=-1).mean(-1), valid_hand & valid_mano, 1000.)
+    add_metric("camera_pve", (output.vertices_camera - gt_box_points).norm(dim=-1).mean(-1), valid_hand & valid_mano, 1000.)
+    add_metric("existence_coverage", active.float(), valid_hand)
+    quality_logits = getattr(output.decoder, "reliability_logits", None)
+    if quality_logits is not None:
+        quality = quality_logits.sigmoid()
+        target_quality = torch.exp(-anchor_error / 8.)
+        accumulator.add("quality_population", valid_2d.sum())
+        add_metric("quality_mae", (quality-target_quality).abs(), valid_2d)
+        for threshold in QUALITY_THRESHOLDS:
+            selected = valid_2d & (quality >= threshold)
+            accumulator.add(f"quality_{threshold}_count", selected.sum())
+            accumulator.add(f"quality_{threshold}_error_sum_px", _selected_sum(anchor_error, selected))
+        for index in range(5):
+            selected = valid_2d & (quality >= index / 5) & ((quality < (index+1)/5) | (index == 4))
+            accumulator.add(f"quality_bin_{index}_count", selected.sum())
+            accumulator.add(f"quality_bin_{index}_prediction_sum", _selected_sum(quality, selected))
+            accumulator.add(f"quality_bin_{index}_target_sum", _selected_sum(target_quality, selected))
+    prior = getattr(output.decoder, "wrist_prior", None)
+    log_scale = getattr(output.decoder, "wrist_log_scale", None)
+    if prior is not None and log_scale is not None:
+        prior_error = (prior - gt_joints_camera[..., 0, :]).abs()
+        scale = log_scale.exp()
+        axes = wrist_valid[..., None].expand_as(prior_error)
+        add_metric("prior_nll", (prior_error/scale + log_scale).sum(-1), wrist_valid)
+        add_metric("prior_95_coverage", (prior_error <= -math.log(.05)*scale).float(), axes)
+        add_metric("prior_scale", scale, axes)
+        confident = wrist_valid & (scale.norm(dim=-1) < .02)
+        add_metric("prior_confident_failure", (prior_error.norm(dim=-1) > .1).float(), confident)
+
+    # Frozen, prediction-independent strata: 1 feature-cell edge band, <48px
+    # hand-box diagonal, >1m/s wrist speed, or certified occlusion labels.
+    inside = valid_3d & ((gt_projected >= 0) & (gt_projected < 1)).all(-1) & (gt_joints_camera[..., 2] > .01)
+    band = 32. / pixel_scale
+    edge = (inside & (torch.minimum(gt_projected, 1-gt_projected) < band).any(-1)).any(-1)
+    minimum = torch.where(inside[..., None], gt_projected, torch.inf).amin(-2)
+    maximum = torch.where(inside[..., None], gt_projected, -torch.inf).amax(-2)
+    small = ((maximum - minimum) * pixel_scale.squeeze(-2)).norm(dim=-1) < 48.
+    fast = torch.zeros_like(valid_hand)
+    timestamps = batch.get("timestamps")
+    if isinstance(timestamps, Tensor):
+        for pred, truth, mask, prefix in (
+            (output.joints_root_mano, gt_joints_root, valid_3d & valid_mano[..., None], "root"),
+            (output.joints_camera[..., 0, :], gt_joints_camera[..., 0, :], wrist_valid, "wrist"),
+        ):
+            vel, vm, acc, am = motion_errors(pred, truth, mask, timestamps)
+            add_metric(f"{prefix}_velocity", vel, vm)
+            add_metric(f"{prefix}_acceleration", acc, am)
+        speed, speed_valid, _, _ = motion_errors(gt_joints_camera[..., 0, :],
+            torch.zeros_like(gt_joints_camera[..., 0, :]), wrist_valid, timestamps)
+        fast[:, 1:] = (speed > 1.) & speed_valid
+    observed, observed_valid = batch.get("observed"), batch.get("observed_valid")
+    occluded = torch.zeros_like(valid_hand)
+    if isinstance(observed, Tensor) and isinstance(observed_valid, Tensor):
+        occluded = (inside & observed_valid.bool() & ~observed.bool()).any(-1)
+    camera_hand = torch.where(valid_3d, camera_error, 0.).sum(-1) / valid_3d.sum(-1).clamp_min(1)
+    strata = dict(edge=edge, small=small, fast=fast, oos=oos, occluded=occluded)
+    if isinstance(timestamps, Tensor):
+        duration_masks, runs, censored = oos_duration_masks(oos, timestamps, valid_hand)
+        strata.update(duration_masks)
+        accumulator.add("oos_within_clip_runs", runs)
+        accumulator.add("oos_censored_runs", censored)
+    for stratum, mask in strata.items():
+        mask = mask & wrist_valid
+        accumulator.add(f"{stratum}_count", mask.sum())
+        accumulator.add(f"{stratum}_active_count", (active & mask).sum())
+        for key, error in (("root", mpjpe), ("camera", camera_hand), ("wrist", wrist_error), ("depth", depth_error)):
+            accumulator.add(f"{stratum}_{key}_sum_mm", _selected_sum(error, mask, 1000.))
+
+    for batch_index in range(matched.shape[0]):
+        for side in range(2):
+            jitter_sum, jitter_count = jitter_matched_run_sum_count(
+                output.joints_camera[batch_index, :, side].float(),
+                matched[batch_index, :, side],
+            )
+            accumulator.add("jitter_sum_mm", float(jitter_sum.cpu()) * 1000.0)
+            accumulator.add("jitter_count", jitter_count)
+
+
+def validate_metric_result(result: Mapping[str, float | int | None]) -> None:
+    """Fail a long evaluation if a reported numeric metric is not finite."""
+
+    for key, value in result.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise RuntimeError(f"non-finite evaluation result {key}={value}")

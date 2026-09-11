@@ -11,14 +11,18 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from dreamhand.decoder import DreamHandDecoder
-from dreamhand.ray import RayHead
-from dreamhand.architectures import add_architecture_argument, architecture_spec
+from handprism.decoder import HandPrismDecoder
+from handprism.ray import RayHead
+from handprism.architectures import add_architecture_argument, architecture_spec
+from handprism.fusion_runtime import fusion_config_from_json
+from handprism.config import DecoderConfig
 
 
-def inspect_architecture(architecture: str) -> dict:
+def inspect_architecture(architecture: str, config: dict | None = None) -> dict:
     spec = architecture_spec(architecture)
-    decoder = DreamHandDecoder(architecture=architecture)
+    value = config or {"architecture": architecture}
+    decoder = HandPrismDecoder(DecoderConfig(**value.get("decoder", {})), architecture=architecture,
+                               fusion_config=fusion_config_from_json(value))
     ray = RayHead()
     decoder_count = sum(p.numel() for p in decoder.parameters())
     ray_count = sum(p.numel() for p in ray.parameters())
@@ -29,15 +33,19 @@ def inspect_architecture(architecture: str) -> dict:
         "decoder_parameters": decoder_count,
         "ray_head_parameters": ray_count,
         "decoder_and_ray_parameters": decoder_count + ray_count,
-        "scope": "Default decoder and ray head only; excludes Wan, LoRA, VAE and MANO",
+        "scope": "Configured decoder and ray head only; excludes Wan, LoRA, VAE and MANO",
+        "fusion": value.get("fusion", {}),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_architecture_argument(parser)
+    parser.add_argument("--config", type=Path, help="Include the selected Fusion modules in parameter counts")
     args = parser.parse_args()
-    print(json.dumps(inspect_architecture(args.architecture), indent=2, sort_keys=True))
+    from scripts.train import load_config
+    config = load_config(args.config, architecture=args.architecture) if args.config else None
+    print(json.dumps(inspect_architecture(args.architecture, config), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

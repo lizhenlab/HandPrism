@@ -28,7 +28,7 @@ if [[ -x "${project_root}/.venv/bin/modelscope" ]]; then
     --include config.json diffusion_pytorch_model.safetensors Wan2.2_VAE.pth \
     --local_dir "${model_dir}"
 else
-  DREAMHAND_MODEL_DIR="${model_dir}" "${python_bin}" - <<'PY'
+  HANDPRISM_MODEL_DIR="${model_dir}" "${python_bin}" - <<'PY'
 import os
 
 from huggingface_hub import snapshot_download
@@ -41,12 +41,12 @@ snapshot_download(
         "diffusion_pytorch_model.safetensors",
         "Wan2.2_VAE.pth",
     ],
-    local_dir=os.environ["DREAMHAND_MODEL_DIR"],
+    local_dir=os.environ["HANDPRISM_MODEL_DIR"],
 )
 PY
 fi
 
-DREAMHAND_MODEL_DIR="${model_dir}" "${python_bin}" - <<'PY'
+HANDPRISM_MODEL_DIR="${model_dir}" "${python_bin}" - <<'PY'
 import hashlib
 import os
 from pathlib import Path
@@ -59,7 +59,7 @@ expected = {
     "Wan2.2_VAE.pth":
         "20eb789667fa5e60e7516bf509512f6cb61f01b0aa0695eadaea930c13892b36",
 }
-root = Path(os.environ["DREAMHAND_MODEL_DIR"])
+root = Path(os.environ["HANDPRISM_MODEL_DIR"])
 for name, wanted in expected.items():
     digest = hashlib.sha256()
     with (root / name).open("rb") as stream:

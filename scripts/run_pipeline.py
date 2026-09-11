@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 import json
 from pathlib import Path
@@ -11,11 +15,11 @@ import shutil
 import sys
 import time
 from typing import Any
-from dreamhand.completion import validated_metrics
-from dreamhand.data.dataset import read_jsonl
-from dreamhand.data.policy import SUPPORTED_DATASETS, allowed_path
-from dreamhand.paths import v3_run_path
-from dreamhand.architectures import add_architecture_argument, architecture_spec
+from handprism.completion import validated_metrics
+from handprism.data.dataset import read_jsonl
+from handprism.data.policy import SUPPORTED_DATASETS, allowed_path
+from handprism.paths import v3_run_path
+from handprism.architectures import FUSION, add_architecture_argument, architecture_spec
 from scripts.train import load_config
 
 
@@ -27,7 +31,7 @@ def atomic_json(path: Path, value: Any) -> None:
 
 class Supervisor:
     def __init__(self, root: Path, control_dir: Path, world_size: int, architecture: str) -> None:
-        architecture_spec(architecture)
+        self.implementation_id = architecture_spec(architecture).implementation_id
         self.architecture = architecture
         self.root = root
         self.control_dir = control_dir
@@ -35,12 +39,15 @@ class Supervisor:
         existing = self.control_dir / "state.json"
         if existing.exists() and json.loads(existing.read_text()).get("architecture") != architecture:
             raise ValueError("supervisor directory belongs to a different or unnamed architecture")
+        if existing.exists() and json.loads(existing.read_text()).get("implementation_id") != self.implementation_id:
+            raise ValueError("supervisor implementation changed; choose a new control directory")
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self.events = control_dir / "supervisor.jsonl"
         self.state = control_dir / "state.json"
 
     def event(self, event_type: str, **values: Any) -> None:
-        row = {"type": event_type, "time_unix": time.time(), "architecture": self.architecture, **values}
+        row = {"type": event_type, "time_unix": time.time(), "architecture": self.architecture,
+               "implementation_id": self.implementation_id, **values}
         with self.events.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
         print(json.dumps(row, sort_keys=True), flush=True)
@@ -48,7 +55,8 @@ class Supervisor:
     def set_state(self, status: str, **values: Any) -> None:
         atomic_json(
             self.state,
-            {"status": status, "time_unix": time.time(), "architecture": self.architecture, **values},
+            {"status": status, "time_unix": time.time(), "architecture": self.architecture,
+             "implementation_id": self.implementation_id, **values},
         )
 
     def run(self, phase: str, command: list[str]) -> None:
@@ -170,7 +178,7 @@ def main() -> int:
         type=Path,
     )
     parser.add_argument(
-        "--manifest-root", type=Path, default=Path("data/manifests/two_dataset_v2_clean")
+        "--manifest-root", type=Path, help="default: infer from both solver configs"
     )
     parser.add_argument("--standard-config", type=Path)
     parser.add_argument(
@@ -190,9 +198,10 @@ def main() -> int:
     if root != Path(__file__).resolve().parents[1]:
         raise ValueError("supervisor cannot write into another workspace")
     stem = args.architecture.replace("-", "_")
-    control_dir = v3_run_path(root, args.control_dir or Path(f"runs/{stem}_full"))
-    standard_run_dir = v3_run_path(root, args.standard_run_dir or Path(f"runs/{stem}_standard"))
-    kfree_run_dir = v3_run_path(root, args.kfree_run_dir or Path(f"runs/{stem}_kfree"))
+    run_stem = f"{stem}_r3" if args.architecture == FUSION else stem
+    control_dir = v3_run_path(root, args.control_dir or Path(f"runs/{run_stem}_full"))
+    standard_run_dir = v3_run_path(root, args.standard_run_dir or Path(f"runs/{run_stem}_standard"))
+    kfree_run_dir = v3_run_path(root, args.kfree_run_dir or Path(f"runs/{run_stem}_kfree"))
     args.standard_config = args.standard_config or Path(f"configs/{stem}_standard.json")
     args.kfree_config = args.kfree_config or Path(f"configs/{stem}_kfree.json")
 
@@ -211,10 +220,18 @@ def main() -> int:
             kfree_run_dir,
         ),
     )
+    manifest_roots = set()
     for solver, path, _ in experiments:
         checked = load_config(path, architecture=args.architecture)
         if checked["solver"] != solver:
             raise ValueError("supervisor phase/config solver mismatch")
+        manifest_roots.add(resolve(Path(checked["manifests"])).resolve())
+    if len(manifest_roots) != 1:
+        raise ValueError("both solvers must use the same frozen manifest directory")
+    configured_manifest = manifest_roots.pop()
+    if args.manifest_root is not None and resolve(args.manifest_root).resolve() != configured_manifest:
+        raise ValueError("explicit manifest directory disagrees with the solver configs")
+    args.manifest_root = configured_manifest
     supervisor = Supervisor(root, control_dir, args.world_size, args.architecture)
     try:
         for _, _, directory in experiments:

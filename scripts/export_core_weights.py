@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 import json
 from pathlib import Path
@@ -11,9 +15,9 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
-from dreamhand.architectures import CORE, require_legacy_digest, validate_checkpoint_identity
-from dreamhand.data.policy import allowed_path
-from dreamhand.release import RELEASE_FORMAT, file_sha256, inference_settings
+from handprism.architectures import CORE, require_legacy_digest, validate_checkpoint_identity
+from handprism.data.policy import allowed_path
+from handprism.release import RELEASE_FORMAT, file_sha256, inference_settings
 from scripts.train import load_config
 
 

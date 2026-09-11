@@ -10,13 +10,13 @@ from pathlib import Path
 
 import torch
 
-from dreamhand.backbone import (
+from handprism.backbone import (
     WanCleanLatentEncoder,
     WanFrozenVAEEncoder,
     load_official_vae,
     load_official_wan,
 )
-from dreamhand.lora import configure_trainable_backbone, inject_wan_lora
+from handprism.lora import configure_trainable_backbone, inject_wan_lora
 
 
 def main() -> None:

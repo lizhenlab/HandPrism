@@ -8,6 +8,10 @@ No resizing, stereo splitting, camera guessing or architecture inference.
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    from _bootstrap import use_workspace
+    use_workspace()
+
 import argparse
 from pathlib import Path
 from typing import Any
@@ -15,14 +19,15 @@ from typing import Any
 import numpy as np
 import torch
 
-from dreamhand.architectures import (
+from handprism.architectures import (
     add_architecture_argument, validate_checkpoint_identity, require_legacy_digest,
 )
-from dreamhand.camera import PINHOLE, FISHEYE624_UPRIGHT
-from dreamhand.data.policy import allowed_path
-from dreamhand.paths import v3_run_path
-from dreamhand.precision import _tensors
-from dreamhand.release import load_released_weights
+from handprism.camera import PINHOLE, FISHEYE624_UPRIGHT
+from handprism.data.policy import allowed_path
+from handprism.paths import v3_run_path
+from handprism.precision import _tensors
+from handprism.release import load_released_weights
+from handprism.fusion_runtime import fusion_forward_options, fusion_config_from_json
 from scripts.evaluate import build_system, save_prediction
 from scripts.train import load_config, load_trainable_state, resolve, sha256
 
@@ -52,6 +57,22 @@ def load_clip(path: Path, solver: str) -> dict[str, Any]:
             "source_image_size": None,
             "gt_ray_field": None,
         }
+        if "rgb_high" in data:
+            detail = data["rgb_high"]
+            if (detail.dtype != np.uint8 or detail.ndim != 4 or detail.shape[0] != frames
+                    or detail.shape[-1] != 3 or min(detail.shape[1:3]) <= 0):
+                raise ValueError("rgb_high must be aligned uint8 RGB [T,H_high,W_high,3]")
+            if abs(detail.shape[2] / detail.shape[1] - width / height) > .005:
+                raise ValueError("rgb_high and video must share the same field of view and aspect ratio")
+            if detail.shape[1] <= height or detail.shape[2] <= width:
+                raise ValueError("rgb_high must retain more source detail than the global video")
+            batch["rgb_high"] = torch.from_numpy(detail.copy()).permute(3, 0, 1, 2)[None]
+        if "timestamps" in data:
+            timestamps = np.asarray(data["timestamps"], dtype=np.float64)
+            if timestamps.shape != (frames,) or not np.isfinite(timestamps).all() or (np.diff(timestamps) < 0).any():
+                raise ValueError("timestamps must be finite nondecreasing [T] seconds")
+            batch["timestamps"] = torch.from_numpy(timestamps.copy())[None]
+            batch["timestamp_source"] = ["user_supplied_seconds"]
         # K-free never consumes supplied GT camera fields, even if present.
         if solver == "kfree":
             return batch
@@ -101,6 +122,7 @@ def predict_clip(system, vae_encoder, batch: dict[str, Any], config: dict[str, A
             distortion=batch["distortion"], camera_model=batch["camera_model"],
             calibration_ray_field=batch["gt_ray_field"] if config["solver"] == "standard" else None,
             camera_parameters=batch["camera_parameters"], source_image_size=batch["source_image_size"],
+            **fusion_forward_options(config, batch),
         )
     return output, batch
 
@@ -136,6 +158,8 @@ def main() -> int:
             legacy_sha256=digest if args.legacy_weights else None,
         )
     batch = load_clip(allowed_path(resolve(root, str(args.input))), config["solver"])
+    if fusion_config_from_json(config).local_rgb and batch.get("rgb_high") is None:
+        raise ValueError("this Fusion checkpoint requires original high-resolution rgb_high in the NPZ")
     device = torch.device(args.device)
     dtype = torch.bfloat16 if config.get("dtype") == "bfloat16" else torch.float16
     system, vae_encoder = build_system(root, config, device, dtype if device.type == "cuda" else torch.float32)
